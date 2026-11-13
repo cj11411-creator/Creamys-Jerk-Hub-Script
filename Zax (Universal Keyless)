@@ -271,7 +271,7 @@ local gui=create("ScreenGui",{
 local backdrop=rounded(create("Frame",{
     Name="Shadow",Visible=false,Size=UDim2.fromOffset(1060,667),
     Position=UDim2.new(.5,-525,.5,-324),
-    BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=.52,
+    BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=1,
     BorderSizePixel=0,
 },gui),21)
 local window=rounded(create("Frame",{
@@ -2484,7 +2484,7 @@ stroke(opener,C.mint,.45)
 local function setVisible(v)
     shown=v
     window.Visible=v
-    backdrop.Visible=v
+    backdrop.Visible=false -- Never re-enable the shadow behind the window
     opener.Visible=not v
 end
 on(opener.MouseButton1Click,function() setVisible(true) end)
