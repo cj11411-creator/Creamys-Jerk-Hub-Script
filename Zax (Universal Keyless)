@@ -1,1 +1,2835 @@
+--[[
+    ZAX UNIVERSAL HUB / MAIN AIM v3
+    Redesigned workspace UI; original gameplay feature callbacks retained.
+    Single-file LocalScript for Roblox R6/R15.
+    Use in games that permit this sort of play.
 
+    IMPORTANT: This does NOT grant server permissions or bypass FilteringEnabled.
+    Camera aimbot works client-side in games that allow camera movement.
+    Legacy silent aim requires a compatible execution environment and weapons
+    that read the Roblox Mouse.Hit/Target properties; not universal.
+    This does NOT bypass server validation or FilteringEnabled.
+]]
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+
+local me = Players.LocalPlayer
+if not me then return end
+local playerGui = me:WaitForChild("PlayerGui")
+local globalEnv = (type(getgenv) == "function" and getgenv()) or _G
+if type(globalEnv.CreamysChaosLabUnload) == "function" then
+    pcall(globalEnv.CreamysChaosLabUnload)
+end
+
+-- Runtime state
+-- Group optional settings into one table to avoid Roblox/Luau local limits.
+local extra = {
+    flingMaxDistance = 0, flingContactOffset = .78,
+    flingLiftPercent = 35, flingReturnHeight = 2,
+    flightVerticalPercent = 100, flightBoost = 1.75,
+    flightSmoothing = 0, flightFacing = "Camera",
+    flightCurrentVelocity = nil,
+    noclipAccessories = "Include",
+    sprintMultiplier = 1.8, sprintKey = "Shift",
+    jumpHeight = 17, airJumpVelocity = 55, maxAirJumps = 0,
+    airJumpCount = 0, chamsOutlineOpacity = .04,
+    chamsColorMode = "Theme", nameTextSize = 12,
+    nameShowHealth = "Off", nameVerticalOffset = 2.2,
+    distanceTextSize = 10, distanceRounding = 1,
+    espRefreshRate = .35, notifications = "On",
+    uiScale = 1,
+    -- Additional per-feature controls
+    flightDescendPercent = 100, flightBoostKey = "Shift",
+    sprintMode = "Hold", chamsRange = 0, nameRange = 0,
+    espThroughWalls = "On", espStrokeTransparency = .3,
+    -- UI polishing
+    cornerRoundness = 1.35, borderSoftness = 25,
+    toastDuration = 2.5, uiMotion = "On",
+    -- Box ESP uses per-frame projection and cached bounds; no Tracers feature.
+    overlay = {
+        boxes=false, boxWidth=2, boxRange=0,
+        colorMode="Theme", boundsRefresh=0.5,
+    },
+    clickTeleportEnabled=false, clickTeleportHeight=4,
+    clickTeleportMaxDistance=0, clickTeleportModifier="Ctrl",
+}
+do
+    local savedUi=globalEnv.ZAXUiStyle
+    if type(savedUi)=="table" then
+        extra.cornerRoundness=math.clamp(tonumber(savedUi.cornerRoundness) or extra.cornerRoundness, .75, 1.85)
+        extra.borderSoftness=math.clamp(tonumber(savedUi.borderSoftness) or extra.borderSoftness, 0, 85)
+        extra.toastDuration=math.clamp(tonumber(savedUi.toastDuration) or extra.toastDuration, 1, 7)
+        if savedUi.uiMotion=="Off" then extra.uiMotion="Off" end
+    end
+end
+function extra.saveUiStyle()
+    globalEnv.ZAXUiStyle={cornerRoundness=extra.cornerRoundness,
+        borderSoftness=extra.borderSoftness,
+        toastDuration=extra.toastDuration,uiMotion=extra.uiMotion}
+end
+local alive = true
+local shown = true
+local toggleKey = Enum.KeyCode.RightShift
+local rebinding = false
+local selected = nil
+local searchText = ""
+local char, hum, root
+local flyActive, noclipActive, speedActive, jumpActive = false,false,false,false
+local chamsActive, namesActive, distancesActive = false,false,false
+local infiniteJumpActive=false
+local teamCheckActive = false
+local teamFilterMode = "team"
+local flySpeed = 65
+local walkSpeedValue = 32
+local jumpPowerValue = 75
+local jumpHeightValue = 17
+local noclipScope = "All Parts"
+local jumpGap = .15
+local lastExtraJump = 0
+local flingPower = 110
+local flingDuration = .43
+local chamsOpacity = .62
+local resetScope = "Movement Only"
+local infoTopic = "Replication"
+local unloadConfirm = "Off"
+local unloadArmed = false
+local chamDepth = "Through Walls"
+local nameFormat = "Both"
+local distanceLimit = 0
+local originalSpeed, originalJumpPower, originalJumpHeight
+local flyVelocity, flyGyro, flyRoot, flyHumanoid, prevPlatform, prevAutoRotate
+local noclipParts = {}
+local espItems = {}
+local refreshToggles
+local setFly
+local connections = {}
+local moveTimer = 0
+local contactBusy = false
+local contactToken = 0
+local previousRoot, previousHum, previousCF, previousCollision, previousAutoRotate
+local version = 0
+
+local function on(signal, fn)
+    local conn = signal:Connect(fn)
+    table.insert(connections, conn)
+    return conn
+end
+-- Every themed property is tracked without keeping destroyed roster cells alive.
+local C
+local themedObjects = setmetatable({}, {__mode = "k"})
+local themedGradients = setmetatable({}, {__mode = "k"})
+local themeRoles = {"canvas","rail","panel","card","hover","stroke",
+    "text","dim","mint","blue","orange","pink","selected","badge"}
+local themeColorProps = {"BackgroundColor3","TextColor3","ImageColor3",
+    "ScrollBarImageColor3","Color"}
+local function colorRole(value)
+    if not C or value == nil then return nil end
+    for _, role in ipairs(themeRoles) do
+        if C[role] == value then return role end
+    end
+    return nil
+end
+local function create(class, props, parent)
+    local obj = Instance.new(class)
+    for k, v in pairs(props or {}) do obj[k] = v end
+    if parent then obj.Parent = parent end
+    local assigned = {}
+    for _, prop in ipairs(themeColorProps) do
+        if props and props[prop] then
+            local role = colorRole(props[prop])
+            if role then assigned[prop] = role end
+        end
+    end
+    if next(assigned) then themedObjects[obj] = assigned end
+    return obj
+end
+-- Track GUI edges so roundness/softness can update every panel live.
+extra.edge={corners=setmetatable({}, {__mode="k"}),strokes=setmetatable({}, {__mode="k"})}
+function extra.edge.roundPixels(base)
+    return math.max(2, math.floor(base*extra.cornerRoundness+.5))
+end
+function extra.edge.softenedAlpha(alpha)
+    return math.clamp(alpha+(1-alpha)*extra.borderSoftness/100,0,1)
+end
+local function rounded(obj, r)
+    local original=r or 11
+    local corner=create("UICorner", {CornerRadius=UDim.new(0,extra.edge.roundPixels(original))},obj)
+    extra.edge.corners[corner]=original
+    return obj
+end
+local function stroke(obj, c, alpha, thick)
+    local original=alpha or 0
+    local outline=create("UIStroke", {Color=c, Transparency=extra.edge.softenedAlpha(original),
+        Thickness=thick or 1, ApplyStrokeMode=Enum.ApplyStrokeMode.Border},obj)
+    extra.edge.strokes[outline]=original
+    return outline
+end
+function extra.edge.applyStyle()
+    for obj,base in pairs(extra.edge.corners) do
+        if obj.Parent then obj.CornerRadius=UDim.new(0,extra.edge.roundPixels(base)) end
+    end
+    for obj,base in pairs(extra.edge.strokes) do
+        if obj.Parent then obj.Transparency=extra.edge.softenedAlpha(base) end
+    end
+end
+local function gradient(obj, first, second, angle)
+    local grad = create("UIGradient", {Color = ColorSequence.new(first,second),
+        Rotation = angle or 0}, obj)
+    local firstRole, secondRole = colorRole(first), colorRole(second)
+    if firstRole and secondRole then
+        themedGradients[grad] = {firstRole, secondRole}
+    end
+    return grad
+end
+local function animate(obj, time, props)
+    if not alive or not obj or not obj.Parent then return end
+    if extra.uiMotion=="Off" then
+        for property,value in pairs(props) do obj[property]=value end
+        return
+    end
+    local t = TweenService:Create(obj,
+        TweenInfo.new(time or .18, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), props)
+    t:Play()
+end
+
+-- Presets change both the accent AND the surrounding UI palette.
+local palettes = {
+    Graphite={canvas="0F1013",rail="17181C",panel="202126",card="292B31",
+        hover="353740",stroke="464951",text="F2F3F5",dim="A5A9B3",
+        mint="B7BEC9",blue="B7BEC9",orange="B7BEC9",pink="B7BEC9"},
+    Amethyst={canvas="0D0B18",rail="141122",panel="1B1730",card="29223F",
+        hover="382B53",stroke="584A75",text="FAF7FF",dim="AFA6C6",
+        mint="C3A6FF",blue="95BDFB",orange="F5BC91",pink="F7A1D9"},
+    Glacier={canvas="09121A",rail="0D1B26",panel="122431",card="173242",
+        hover="204454",stroke="386779",text="EAF9FF",dim="96B5C6",
+        mint="66E1FF",blue="8FB9FF",orange="FFC07E",pink="FF98BD"},
+    Rose={canvas="170F19",rail="211523",panel="291C2C",card="372438",
+        hover="49304A",stroke="75506D",text="FFF3FA",dim="C3A5B8",
+        mint="FF8FCC",blue="B9ADFF",orange="FFC58E",pink="FC728D"},
+    Evergreen={canvas="0A1412",rail="0E1D19",panel="14251F",card="1B322A",
+        hover="234339",stroke="416A5B",text="EFFCF5",dim="9EBDAE",
+        mint="91F4B1",blue="93D9FF",orange="F9C181",pink="FAA2BE"},
+    Ember={canvas="18110E",rail="211813",panel="2B201A",card="392B21",
+        hover="49372A",stroke="765744",text="FFF7EB",dim="C5AF9C",
+        mint="FFBB72",blue="B2C5FF",orange="FFD18C",pink="FFA3AA"},
+}
+local paletteNames={"Graphite","Amethyst","Glacier","Rose","Evergreen","Ember"}
+local function hexColor(value)
+    return Color3.fromRGB(
+        tonumber(value:sub(1,2),16),
+        tonumber(value:sub(3,4),16),
+        tonumber(value:sub(5,6),16))
+end
+-- Versioned theme preference starts the redesigned hub in graphite rather
+-- than inheriting an old Rose/Evergreen preference from prior NOX builds.
+local savedTheme = globalEnv.CreamysChaosLabThemeGraphite
+if type(savedTheme)~="table" then savedTheme={} end
+local paletteName = palettes[savedTheme.preset] and savedTheme.preset or "Graphite"
+local accentHue = math.clamp(tonumber(savedTheme.hue) or .44,0,1)
+local accentSaturation = math.clamp(tonumber(savedTheme.saturation) or .72,.18,1)
+local customAccent = savedTheme.custom==true
+local surfaceOpacity = math.clamp(tonumber(savedTheme.opacity) or .14, 0, .32)
+local function buildPalette(name)
+    local preset=palettes[name] or palettes.Graphite
+    local colors={}
+    for role,hex in pairs(preset) do colors[role]=hexColor(hex) end
+    if customAccent then
+        colors.mint=Color3.fromHSV(accentHue,accentSaturation,1)
+        colors.blue=Color3.fromHSV((accentHue+.105)%1,accentSaturation*.85,1)
+        colors.orange=Color3.fromHSV((accentHue+.36)%1,.72,1)
+        colors.pink=Color3.fromHSV((accentHue+.8)%1,.74,1)
+    end
+    -- Every action accent follows the chosen theme instead of leaving
+    -- pink / orange / blue accents stuck on the old palette.
+    colors.blue=colors.mint:Lerp(colors.text,.24)
+    colors.orange=colors.mint:Lerp(colors.dim,.20)
+    colors.pink=colors.mint
+    colors.selected=colors.card:Lerp(colors.mint,.22)
+    colors.badge=colors.rail:Lerp(colors.mint,.17)
+    return colors
+end
+C = buildPalette(paletteName)
+local function colorHex(color)
+    return string.format("#%02X%02X%02X",
+        math.floor(color.R*255+.5),
+        math.floor(color.G*255+.5),
+        math.floor(color.B*255+.5))
+end
+
+-- A restrained 3-column workspace. The gameplay callbacks below are unchanged.
+-- Build GUI before waiting for character parts so it can always initialize.
+local previousGui=playerGui:FindFirstChild("CreamysChaosLab")
+if previousGui then previousGui:Destroy() end
+local gui=create("ScreenGui",{
+    Name="CreamysChaosLab",ResetOnSpawn=false,DisplayOrder=500,
+    IgnoreGuiInset=true,ZIndexBehavior=Enum.ZIndexBehavior.Sibling,
+},playerGui)
+
+local backdrop=rounded(create("Frame",{
+    Name="Shadow",Size=UDim2.fromOffset(1060,667),
+    Position=UDim2.new(.5,-525,.5,-324),
+    BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=.52,
+    BorderSizePixel=0,
+},gui),21)
+local window=rounded(create("Frame",{
+    Name="NOXWindow",Size=UDim2.fromOffset(1050,656),
+    Position=UDim2.new(.5,-530,.5,-330),
+    BackgroundColor3=C.canvas,BackgroundTransparency=surfaceOpacity,BorderSizePixel=0,
+    ClipsDescendants=true,Active=true,
+},gui),19)
+stroke(window,C.stroke,.40,1)
+
+-- Dedicated sidebar: never overlaid over page content.
+local left=create("Frame",{
+    Size=UDim2.fromOffset(194,656),BackgroundColor3=C.rail,
+    BackgroundTransparency=surfaceOpacity*.78,BorderSizePixel=0,
+},window)
+create("Frame",{Position=UDim2.fromOffset(193,0),
+    Size=UDim2.new(0,1,1,0),BackgroundColor3=C.stroke,
+    BackgroundTransparency=.54,BorderSizePixel=0},left)
+local brandMark=rounded(create("Frame",{
+    Position=UDim2.fromOffset(18,23),Size=UDim2.fromOffset(38,38),
+    BackgroundColor3=C.mint,BorderSizePixel=0,
+},left),12)
+create("TextLabel",{Size=UDim2.fromScale(1,1),Text="Z",
+    TextColor3=C.canvas,Font=Enum.Font.GothamBlack,TextSize=23,
+    BackgroundTransparency=1},brandMark)
+create("TextLabel",{Position=UDim2.fromOffset(67,20),Size=UDim2.fromOffset(109,24),
+    Text="ZAX",Font=Enum.Font.GothamBold,TextSize=19,
+    TextColor3=C.text,TextXAlignment=Enum.TextXAlignment.Left,
+    BackgroundTransparency=1},left)
+create("TextLabel",{Position=UDim2.fromOffset(67,44),Size=UDim2.fromOffset(112,17),
+    Text="UNIVERSAL HUB",Font=Enum.Font.GothamMedium,TextSize=10,
+    TextColor3=C.dim,TextXAlignment=Enum.TextXAlignment.Left,
+    BackgroundTransparency=1},left)
+create("Frame",{Position=UDim2.fromOffset(19,87),
+    Size=UDim2.fromOffset(155,1),BackgroundColor3=C.stroke,
+    BackgroundTransparency=.6,BorderSizePixel=0},left)
+create("TextLabel",{Position=UDim2.fromOffset(20,108),Size=UDim2.fromOffset(150,22),
+    Text="WORKSPACE",Font=Enum.Font.GothamBold,TextSize=10,
+    TextColor3=C.dim,BackgroundTransparency=1,
+    TextXAlignment=Enum.TextXAlignment.Left},left)
+
+local navList={"MAIN","MOVEMENT","VISUALS","THEMES","SETTINGS"}
+local navButtons={}
+local activePage="MAIN"
+local pageNames={
+    MAIN={"Aim","Aimbot, legacy silent aim and FOV controls."},
+    MOVEMENT={"Movement","Tune how your character moves."},
+    VISUALS={"Player visuals","Player highlighting and information."},
+    THEMES={"Appearance","Customize the entire workspace."},
+    SETTINGS={"Preferences","Session controls and configuration."},
+}
+
+-- Workspace header: one clear title, one secondary line, no nested cards.
+local mainHeader=create("Frame",{
+    Position=UDim2.fromOffset(218,18),Size=UDim2.fromOffset(551,91),
+    BackgroundTransparency=1,Active=true,
+},window)
+local eyebrow=create("TextLabel",{
+    Position=UDim2.fromOffset(0,0),Size=UDim2.fromOffset(300,18),
+    Text="ZAX UNIVERSAL HUB  /  WORKSPACE",TextColor3=C.mint,
+    Font=Enum.Font.GothamBold,TextSize=10,
+    TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
+},mainHeader)
+local pageTitle=create("TextLabel",{
+    Position=UDim2.fromOffset(0,21),Size=UDim2.fromOffset(426,36),
+    Text="Aim assistance",TextColor3=C.text,
+    Font=Enum.Font.GothamBold,TextSize=26,
+    TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
+},mainHeader)
+local pageSub=create("TextLabel",{
+    Position=UDim2.fromOffset(0,59),Size=UDim2.fromOffset(490,21),
+    Text="Tune your aim and on-screen target selection.",TextColor3=C.dim,
+    Font=Enum.Font.Gotham,TextSize=12,
+    TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
+},mainHeader)
+local themeChip=rounded(create("TextLabel",{
+    Position=UDim2.fromOffset(528,31),Size=UDim2.fromOffset(172,27),
+    Text="THEME  /  "..string.upper(paletteName),
+    TextColor3=C.dim,BackgroundColor3=C.panel,
+    Font=Enum.Font.GothamBold,TextSize=10,BorderSizePixel=0,
+},window),9)
+local close=rounded(create("TextButton",{
+    Position=UDim2.fromOffset(728,30),Size=UDim2.fromOffset(37,30),
+    Text="X",Font=Enum.Font.GothamBold,TextSize=12,
+    TextColor3=C.dim,BackgroundColor3=C.panel,BorderSizePixel=0,
+    AutoButtonColor=false,
+},window),9)
+stroke(close,C.stroke,.7)
+create("Frame",{Position=UDim2.fromOffset(217,113),
+    Size=UDim2.fromOffset(549,1),BackgroundColor3=C.stroke,
+    BackgroundTransparency=.54,BorderSizePixel=0},window)
+
+-- Lower sidebar controls have their own separated region.
+create("Frame",{Position=UDim2.fromOffset(18,489),
+    Size=UDim2.fromOffset(158,1),BackgroundColor3=C.stroke,
+    BackgroundTransparency=.55,BorderSizePixel=0},left)
+create("TextLabel",{Position=UDim2.fromOffset(20,500),Size=UDim2.fromOffset(148,19),
+    Text="QUICK ACCESS",TextColor3=C.dim,Font=Enum.Font.GothamBold,
+    TextSize=9,TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1},left)
+local keyButton=rounded(create("TextButton",{
+    Position=UDim2.fromOffset(18,527),Size=UDim2.fromOffset(158,34),
+    Text="KEY: RIGHTSHIFT",TextColor3=C.text,
+    Font=Enum.Font.GothamBold,TextSize=10,
+    BackgroundColor3=C.card,BorderSizePixel=0,
+},left),10)
+stroke(keyButton,C.stroke,.69)
+local restore=rounded(create("TextButton",{
+    Position=UDim2.fromOffset(18,571),Size=UDim2.fromOffset(158,34),
+    Text="RESET MOVEMENT",TextColor3=C.dim,
+    BackgroundColor3=C.card,Font=Enum.Font.GothamBold,
+    TextSize=10,BorderSizePixel=0,
+},left),10)
+stroke(restore,C.stroke,.69)
+create("TextLabel",{Position=UDim2.fromOffset(20,615),Size=UDim2.fromOffset(154,20),
+    Text="ZAX  /  UNIVERSAL HUB",TextColor3=C.dim,
+    BackgroundTransparency=1,Font=Enum.Font.GothamMedium,
+    TextSize=9,TextXAlignment=Enum.TextXAlignment.Left},left)
+
+-- Legacy player directory retained internally but hidden: Main uses an aim reference panel.
+local sidePanel=rounded(create("Frame",{
+    Position=UDim2.fromOffset(789,17),Size=UDim2.fromOffset(242,619),
+    BackgroundColor3=C.panel,BackgroundTransparency=surfaceOpacity*.65,BorderSizePixel=0,
+},window),16)
+stroke(sidePanel,C.stroke,.67)
+create("TextLabel",{Position=UDim2.fromOffset(16,15),Size=UDim2.fromOffset(206,22),
+    Text="Player directory",Font=Enum.Font.GothamBold,TextSize=14,
+    TextXAlignment=Enum.TextXAlignment.Left,TextColor3=C.text,
+    BackgroundTransparency=1},sidePanel)
+local playerCount=create("TextLabel",{
+    Position=UDim2.fromOffset(16,40),Size=UDim2.fromOffset(204,16),
+    Text="0 players available",Font=Enum.Font.Gotham,TextSize=10,
+    TextXAlignment=Enum.TextXAlignment.Left,TextColor3=C.dim,
+    BackgroundTransparency=1},sidePanel)
+local targetBox=rounded(create("TextBox",{
+    Position=UDim2.fromOffset(15,70),Size=UDim2.fromOffset(211,37),
+    Text="",PlaceholderText="Search name...",ClearTextOnFocus=false,
+    TextColor3=C.text,PlaceholderColor3=C.dim,
+    BackgroundColor3=C.card,BorderSizePixel=0,
+    Font=Enum.Font.GothamMedium,TextSize=12,
+    TextXAlignment=Enum.TextXAlignment.Left,
+},sidePanel),10)
+stroke(targetBox,C.stroke,.55)
+create("UIPadding",{PaddingLeft=UDim.new(0,12),
+    PaddingRight=UDim.new(0,9)},targetBox)
+local selectedCard=rounded(create("Frame",{
+    Position=UDim2.fromOffset(15,121),Size=UDim2.fromOffset(211,100),
+    BackgroundColor3=C.selected,BorderSizePixel=0,
+},sidePanel),12)
+stroke(selectedCard,C.mint,.68)
+local avatar=rounded(create("ImageLabel",{
+    Position=UDim2.fromOffset(11,12),Size=UDim2.fromOffset(47,47),
+    BackgroundColor3=C.card,BorderSizePixel=0,Image="",
+},selectedCard),10)
+local selectedName=create("TextLabel",{
+    Position=UDim2.fromOffset(68,15),Size=UDim2.fromOffset(131,22),
+    Text="No player",TextColor3=C.text,Font=Enum.Font.GothamBold,
+    TextSize=12,TextXAlignment=Enum.TextXAlignment.Left,
+    TextTruncate=Enum.TextTruncate.AtEnd,BackgroundTransparency=1,
+},selectedCard)
+local selectedHandle=create("TextLabel",{
+    Position=UDim2.fromOffset(68,39),Size=UDim2.fromOffset(131,17),
+    Text="Select below",TextColor3=C.dim,Font=Enum.Font.Gotham,
+    TextSize=10,TextXAlignment=Enum.TextXAlignment.Left,
+    TextTruncate=Enum.TextTruncate.AtEnd,BackgroundTransparency=1,
+},selectedCard)
+create("Frame",{Position=UDim2.fromOffset(11,71),
+    Size=UDim2.fromOffset(190,1),BackgroundColor3=C.stroke,
+    BackgroundTransparency=.65,BorderSizePixel=0},selectedCard)
+local selectedDistance=create("TextLabel",{
+    Position=UDim2.fromOffset(12,78),Size=UDim2.fromOffset(186,15),
+    Text="WAITING FOR TARGET",TextColor3=C.mint,
+    Font=Enum.Font.GothamBold,TextSize=9,
+    TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
+},selectedCard)
+local randomButton=rounded(create("TextButton",{
+    Position=UDim2.fromOffset(15,234),Size=UDim2.fromOffset(211,35),
+    Text="PICK RANDOM PLAYER",TextColor3=C.canvas,
+    Font=Enum.Font.GothamBold,TextSize=10,
+    BackgroundColor3=C.mint,BorderSizePixel=0,
+},sidePanel),10)
+create("TextLabel",{
+    Position=UDim2.fromOffset(17,288),Size=UDim2.fromOffset(200,17),
+    Text="ONLINE PLAYERS",TextColor3=C.dim,Font=Enum.Font.GothamBold,
+    TextSize=10,BackgroundTransparency=1,
+    TextXAlignment=Enum.TextXAlignment.Left,
+},sidePanel)
+local rosterConnections={}
+local function onRoster(signal,fn)
+    local conn=signal:Connect(fn)
+    table.insert(rosterConnections,conn)
+    return conn
+end
+local roster=create("ScrollingFrame",{
+    Position=UDim2.fromOffset(15,316),Size=UDim2.fromOffset(214,243),
+    BackgroundTransparency=1,BorderSizePixel=0,
+    ScrollBarThickness=2,ScrollBarImageColor3=C.mint,
+    CanvasSize=UDim2.fromOffset(0,0),
+    AutomaticCanvasSize=Enum.AutomaticSize.Y,
+},sidePanel)
+create("UIListLayout",{Padding=UDim.new(0,7),
+    SortOrder=Enum.SortOrder.LayoutOrder},roster)
+create("TextLabel",{
+    Position=UDim2.fromOffset(16,579),Size=UDim2.fromOffset(204,21),
+    Text="Effects depend on game rules",TextColor3=C.dim,
+    Font=Enum.Font.Gotham,TextSize=10,
+    BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left,
+},sidePanel)
+
+local contextPanel,contextMark,contextTitle,contextBody,contextContents
+do
+contextPanel=rounded(create("Frame",{
+    Position=UDim2.fromOffset(789,17),Size=UDim2.fromOffset(242,619),
+    BackgroundColor3=C.panel,BackgroundTransparency=surfaceOpacity*.65,BorderSizePixel=0,Visible=false,
+},window),16)
+stroke(contextPanel,C.stroke,.68)
+local contextTop=rounded(create("Frame",{
+    Position=UDim2.fromOffset(16,18),Size=UDim2.fromOffset(210,95),
+    BackgroundColor3=C.badge,BorderSizePixel=0,
+},contextPanel),12)
+contextMark=create("TextLabel",{
+    Position=UDim2.fromOffset(14,9),Size=UDim2.fromOffset(170,21),
+    Text="ZAX",TextColor3=C.mint,Font=Enum.Font.GothamBold,
+    TextSize=11,TextXAlignment=Enum.TextXAlignment.Left,
+    BackgroundTransparency=1,
+},contextTop)
+contextTitle=create("TextLabel",{
+    Position=UDim2.fromOffset(14,40),Size=UDim2.fromOffset(185,36),
+    Text="MOVEMENT",TextColor3=C.text,Font=Enum.Font.GothamBold,
+    TextSize=17,TextXAlignment=Enum.TextXAlignment.Left,
+    BackgroundTransparency=1,
+},contextTop)
+create("TextLabel",{
+    Position=UDim2.fromOffset(17,138),Size=UDim2.fromOffset(200,19),
+    Text="QUICK REFERENCE",TextColor3=C.dim,
+    Font=Enum.Font.GothamBold,TextSize=10,
+    TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
+},contextPanel)
+contextBody=create("TextLabel",{
+    Position=UDim2.fromOffset(17,176),Size=UDim2.fromOffset(207,305),
+    Text="",TextColor3=C.text,Font=Enum.Font.Gotham,
+    TextSize=12,TextWrapped=true,
+    TextYAlignment=Enum.TextYAlignment.Top,
+    TextXAlignment=Enum.TextXAlignment.Left,
+    BackgroundTransparency=1,
+},contextPanel)
+create("Frame",{Position=UDim2.fromOffset(17,512),
+    Size=UDim2.fromOffset(206,1),BackgroundColor3=C.stroke,
+    BackgroundTransparency=.61,BorderSizePixel=0},contextPanel)
+create("TextLabel",{
+    Position=UDim2.fromOffset(17,526),Size=UDim2.fromOffset(203,74),
+    Text="TIP  /  Open a tool's arrow to customize its settings.",
+    Font=Enum.Font.Gotham,TextSize=11,
+    TextColor3=C.dim,TextWrapped=true,
+    BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left,
+    TextYAlignment=Enum.TextYAlignment.Top,
+},contextPanel)
+contextContents={
+    MAIN={icon="AIM  /  AIM SYSTEM",title="Aim configuration",body=
+        "AIMBOT\nHold right mouse to assist, or choose Always from its settings.\n\nSILENT AIM\nOptional legacy Mouse.Hit compatibility. Only supported by certain executors and games.\n\nFOV\nThe radius slider controls the same on-screen target circle for both modes.\n\nThis is not a universal server-side aim override."},
+    MOVEMENT={icon="MOVEMENT  /  CONTROL",title="Move with control",body=
+        "FLY\nWASD to move\nSpace to ascend\nCtrl to descend\n\nSPEED + JUMP\nEach has an adjustable value in its settings drawer.\n\nNOCLIP\nChoose which character parts ignore collisions."},
+    VISUALS={icon="VISUALS  /  PLAYERS",title="See clearly",body=
+        "CHAMS\nHighlight players, with an optional through-wall view.\n\nNAME ESP\nChoose names or usernames.\n\nDISTANCE\nChoose a maximum label range.\n\nTEAM CHECK\nHide teammates."},
+    THEMES={icon="THEMES  /  PERSONALIZE",title="Make it yours",body=
+        "PRESETS\nChoose any of the six coordinated palettes.\n\nCUSTOM ACCENT\nAdjust hue and saturation live.\n\nSESSION MEMORY\nThe chosen look is retained when you rerun the hub during this session."},
+    SETTINGS={icon="SETTINGS  /  CONTROLS",title="Stay in control",body=
+        "WINDOW\nRight Shift shows or hides the hub.\n\nRESTORE\nReset movement when you're finished.\n\nUNLOAD\nDisconnect events, restore the avatar, and close the interface."},
+}
+end
+
+-- Fixed-width cards, with scrolling only in the content column.
+local pages={}
+for _,name in ipairs(navList) do
+    local holder=create("ScrollingFrame",{
+        Position=UDim2.fromOffset(217,130),Size=UDim2.fromOffset(554,450),
+        BackgroundTransparency=1,BorderSizePixel=0,
+        Visible=name==activePage,CanvasSize=UDim2.fromOffset(0,0),
+        AutomaticCanvasSize=Enum.AutomaticSize.Y,
+        ScrollBarThickness=3,ScrollBarImageColor3=C.mint,
+    },window)
+    create("UIListLayout",{
+        Padding=UDim.new(0,10),SortOrder=Enum.SortOrder.LayoutOrder,
+    },holder)
+    create("UIPadding",{
+        PaddingRight=UDim.new(0,8),PaddingBottom=UDim.new(0,10)
+    },holder)
+    pages[name]=holder
+end
+
+local statusPill=rounded(create("Frame",{
+    Position=UDim2.fromOffset(216,594),Size=UDim2.fromOffset(552,43),
+    BackgroundColor3=C.panel,BorderSizePixel=0,
+},window),11)
+stroke(statusPill,C.stroke,.70)
+local statusDot=rounded(create("Frame",{
+    Position=UDim2.fromOffset(14,16),Size=UDim2.fromOffset(9,9),
+    BackgroundColor3=C.mint,BorderSizePixel=0,
+},statusPill),5)
+local status=create("TextLabel",{
+    Position=UDim2.fromOffset(34,10),Size=UDim2.fromOffset(502,23),
+    Text="READY  /  Choose a feature or open its settings",TextColor3=C.dim,
+    Font=Enum.Font.GothamMedium,TextSize=11,
+    TextXAlignment=Enum.TextXAlignment.Left,
+    TextTruncate=Enum.TextTruncate.AtEnd,BackgroundTransparency=1,
+},statusPill)
+
+local function message(heading,detail)
+    if not alive then return end
+    status.Text=heading:upper().."  /  "..detail
+    if extra.notifications=="Off" then return end
+    local toast = rounded(create("Frame",{
+        Position=UDim2.new(1,16,0,20),Size=UDim2.fromOffset(310,62),
+        BackgroundColor3=C.panel,BorderSizePixel=0,ZIndex=30,
+    },gui),12)
+    stroke(toast,C.mint,.4)
+    create("TextLabel",{Position=UDim2.fromOffset(12,8),Size=UDim2.fromOffset(283,18),
+        Text=heading,Font=Enum.Font.GothamBold,TextSize=12,
+        TextColor3=C.text,TextXAlignment=Enum.TextXAlignment.Left,
+        BackgroundTransparency=1,ZIndex=31},toast)
+    create("TextLabel",{Position=UDim2.fromOffset(12,30),Size=UDim2.fromOffset(284,24),
+        Text=detail,Font=Enum.Font.Gotham,TextSize=10,
+        TextColor3=C.dim,TextWrapped=true,
+        TextXAlignment=Enum.TextXAlignment.Left,
+        BackgroundTransparency=1,ZIndex=31},toast)
+    animate(toast,.2,{Position=UDim2.new(1,-325,0,20)})
+    task.delay(extra.toastDuration,function()
+        if toast.Parent then
+            animate(toast,.2,{Position=UDim2.new(1,16,0,20)})
+            task.delay(.23,function() if toast.Parent then toast:Destroy() end end)
+        end
+    end)
+end
+
+local function validTarget()
+    if selected and selected.Parent==Players and selected~=me then
+        return selected
+    end
+    if searchText=="" then return nil end
+    local query = string.lower(searchText)
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p~=me and (string.lower(p.Name)==query or string.lower(p.DisplayName)==query) then
+            return p
+        end
+    end
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p~=me and (string.lower(p.Name):sub(1,#query)==query or
+            string.lower(p.DisplayName):sub(1,#query)==query) then return p end
+    end
+end
+local function targetReady()
+    local p=validTarget()
+    local h=p and p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+    local r=p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+    if h and h.Health>0 and r and r.Parent then return r,p,h end
+end
+local function selfReady()
+    return hum and hum.Parent and hum.Health>0 and
+        root and root.Parent and not root.Anchored
+end
+local function requireTarget()
+    if not selfReady() then
+        message("Avatar unavailable","Respawn or wait for your character")
+        return nil
+    end
+    local tr,p,th=targetReady()
+    if not tr then
+        message("Select a target","Use the live player list on the right")
+        return nil
+    end
+    return tr,p,th
+end
+local function face(position,other)
+    return CFrame.lookAt(position,Vector3.new(other.X,position.Y,other.Z))
+end
+
+local thumbToken=0
+local function displaySelected()
+    local p=validTarget()
+    thumbToken=thumbToken+1
+    local token=thumbToken
+    if not p then
+        selectedName.Text="No player"
+        selectedHandle.Text="Select below"
+        selectedDistance.Text="WAITING FOR TARGET"
+        avatar.Image=""
+        return
+    end
+    selectedName.Text=p.DisplayName
+    selectedHandle.Text="@"..p.Name
+    selectedDistance.Text="TARGET SELECTED"
+    avatar.Image=""
+    task.spawn(function()
+        local success, image = pcall(function()
+            return Players:GetUserThumbnailAsync(p.UserId, Enum.ThumbnailType.HeadShot,
+                Enum.ThumbnailSize.Size100x100)
+        end)
+        if alive and success and token==thumbToken and p==validTarget() then
+            avatar.Image=image
+        end
+    end)
+end
+local function selectTarget(p)
+    if p==me or not p then return end
+    selected=p
+    searchText=p.Name
+    if targetBox.Text~=p.Name then targetBox.Text=p.Name end
+    displaySelected()
+    message("Target selected",p.DisplayName)
+end
+local function playerMatches(p,query)
+    if query=="" then return true end
+    return string.find(string.lower(p.Name),query,1,true) or
+        string.find(string.lower(p.DisplayName),query,1,true)
+end
+local function refreshRoster()
+    if not alive then return end
+    for _,conn in ipairs(rosterConnections) do conn:Disconnect() end
+    table.clear(rosterConnections)
+    for _,child in ipairs(roster:GetChildren()) do
+        if child:IsA("GuiObject") then child:Destroy() end
+    end
+    local total=0
+    local filtered=0
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p~=me then
+            total=total+1
+            if playerMatches(p,string.lower(searchText)) then
+                filtered=filtered+1
+                local highlighted=(selected==p)
+                local cell=rounded(create("TextButton",{
+                    Size=UDim2.fromOffset(208,43),BackgroundColor3=highlighted
+                        and C.selected or C.card,
+                    Text="",AutoButtonColor=false,BorderSizePixel=0,
+                },roster),9)
+                stroke(cell,highlighted and C.mint or C.stroke,
+                    highlighted and .4 or .78)
+                rounded(create("TextLabel",{
+                    Position=UDim2.fromOffset(9,9),Size=UDim2.fromOffset(24,24),
+                    BackgroundColor3=highlighted and C.mint or C.rail,
+                    Text=string.upper(p.Name:sub(1,1)),
+                    Font=Enum.Font.GothamBold,TextSize=11,
+                    TextColor3=highlighted and C.canvas or C.mint,
+                    BorderSizePixel=0,
+                },cell),6)
+                create("TextLabel",{
+                    Position=UDim2.fromOffset(43,6),Size=UDim2.fromOffset(155,18),
+                    Text=p.DisplayName,TextColor3=C.text,
+                    Font=Enum.Font.GothamBold,TextSize=10,
+                    TextXAlignment=Enum.TextXAlignment.Left,
+                    TextTruncate=Enum.TextTruncate.AtEnd,
+                    BackgroundTransparency=1,
+                },cell)
+                create("TextLabel",{
+                    Position=UDim2.fromOffset(43,24),Size=UDim2.fromOffset(155,14),
+                    Text="@"..p.Name,TextColor3=C.dim,
+                    Font=Enum.Font.Gotham,TextSize=9,
+                    TextXAlignment=Enum.TextXAlignment.Left,
+                    TextTruncate=Enum.TextTruncate.AtEnd,
+                    BackgroundTransparency=1,
+                },cell)
+                onRoster(cell.MouseButton1Click,function()
+                    if alive then selectTarget(p) refreshRoster() end
+                end)
+                onRoster(cell.MouseEnter,function()
+                    if alive and selected~=p then
+                        animate(cell,.13,{BackgroundColor3=C.hover})
+                    end
+                end)
+                onRoster(cell.MouseLeave,function()
+                    if alive and selected~=p then
+                        animate(cell,.13,{BackgroundColor3=C.card})
+                    end
+                end)
+            end
+        end
+    end
+    playerCount.Text=tostring(total).." players available"
+    if filtered==0 then
+        create("TextLabel",{
+            Size=UDim2.fromOffset(202,30),BackgroundTransparency=1,
+            Text="No matching players",Font=Enum.Font.Gotham,
+            TextColor3=C.dim,TextSize=11,
+        },roster)
+    end
+end
+
+-- Target interaction uses only the local character.
+local function restoreContact()
+    if previousRoot and previousRoot.Parent then
+        pcall(function()
+            previousRoot.AssemblyLinearVelocity=Vector3.zero
+            previousRoot.AssemblyAngularVelocity=Vector3.zero
+            if previousCollision~=nil then previousRoot.CanCollide=previousCollision end
+            if previousCF then previousRoot.CFrame=previousCF*CFrame.new(0,extra.flingReturnHeight,0) end
+        end)
+    end
+    if previousHum and previousHum.Parent and previousAutoRotate~=nil then
+        pcall(function() previousHum.AutoRotate=previousAutoRotate end)
+    end
+    previousRoot=nil
+    previousHum=nil
+    previousCF=nil
+    previousCollision=nil
+    previousAutoRotate=nil
+    contactBusy=false
+end
+local function contact(kind)
+    if contactBusy then message("Busy","The current physics attempt is still running") return end
+    local tr,p=requireTarget()
+    if not tr then return end
+    if tr.Anchored then message("Anchored target","Physics contact is blocked") return end
+    if extra.flingMaxDistance>0 and (tr.Position-root.Position).Magnitude>extra.flingMaxDistance then
+        message("Too far away","Select a player within "..extra.flingMaxDistance.." studs")
+        return
+    end
+    if flyActive and setFly then setFly(false) end
+    contactToken=contactToken+1
+    local token=contactToken
+    local ourRoot,ourHum=root,hum
+    previousRoot,previousHum=ourRoot,ourHum
+    previousCF,previousCollision,previousAutoRotate=
+        ourRoot.CFrame,ourRoot.CanCollide,ourHum.AutoRotate
+    contactBusy=true
+    message("Contact attempt",kind.." near "..p.DisplayName.." (beta)")
+    task.spawn(function()
+        local success,err=pcall(function()
+            ourHum.AutoRotate=false
+            local start=os.clock()
+            local frame=0
+            local duration=flingDuration
+            while alive and token==contactToken and ourRoot.Parent and tr.Parent
+                and ourHum.Parent and ourHum.Health>0
+                and os.clock()-start<duration do
+                RunService.Heartbeat:Wait()
+                if not alive or token~=contactToken then break end
+                frame=frame+1
+                local side=tr.CFrame.RightVector*((frame%2==0) and extra.flingContactOffset or -extra.flingContactOffset)
+                local p0=tr.Position+side+Vector3.new(0,.25,0)
+                ourRoot.CanCollide=true
+                ourRoot.CFrame=CFrame.new(p0)
+                local direction=tr.Position-p0
+                if direction.Magnitude<.05 then direction=tr.CFrame.LookVector end
+                local linear=flingPower
+                local vertical=math.floor(flingPower*extra.flingLiftPercent/100)
+                local angular=math.floor(flingPower*1.32)
+                ourRoot.AssemblyLinearVelocity=direction.Unit*linear+Vector3.new(0,vertical,0)
+                ourRoot.AssemblyAngularVelocity=Vector3.new(0,angular,0)
+            end
+        end)
+        if token==contactToken then
+            restoreContact()
+            if not success then warn("[ZAX Universal Hub] contact:",err) end
+            if alive then message("Attempt finished","Check another player's view; FE is not guaranteed") end
+        end
+    end)
+end
+
+-- Aim helper state is encapsulated to avoid changing existing movement/ESP logic.
+extra.aim = {
+    enabled=false,silent=false,showFov=false,
+    radius=180,strokeWidth=2,circleOpacity=85,
+    smooth=38,activation="Hold Right Mouse",part="Head",prediction=.06,
+    teamFilter="On",wallCheck="Off",maxDistance=0,
+    partNow=nil,positionNow=nil,hookState=nil,
+}
+function extra.aim.aimPoint()
+    local a=extra.aim
+    if a.partNow and a.partNow.Parent and a.positionNow then
+        return a.partNow,a.positionNow
+    end
+    return nil,nil
+end
+function extra.aim.centerPoint(camera)
+    -- Screen center is fixed; FOV and target search never follow the mouse.
+    return Vector2.new(camera.ViewportSize.X*0.5,camera.ViewportSize.Y*0.5)
+end
+function extra.aim.findTarget(camera)
+    local a=extra.aim
+    local center=extra.aim.centerPoint(camera)
+    local bestPart,bestPos,bestScore=nil,nil,a.radius*a.radius
+    local myPosition=root and root.Parent and root.Position or camera.CFrame.Position
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p~=me and (a.teamFilter~="On" or not me.Team or p.Team~=me.Team) then
+            local character=p.Character
+            local humanoid=character and character:FindFirstChildOfClass("Humanoid")
+            if humanoid and humanoid.Health>0 then
+                local part=character:FindFirstChild(a.part)
+                    or character:FindFirstChild("Head")
+                    or character:FindFirstChild("HumanoidRootPart")
+                if part and part:IsA("BasePart") then
+                    local position=part.Position + part.AssemblyLinearVelocity*a.prediction
+                    if a.maxDistance==0 or (position-myPosition).Magnitude<=a.maxDistance then
+                        local screen,inView=camera:WorldToViewportPoint(position)
+                        if inView and screen.Z>0 then
+                            local dx,dy=screen.X-center.X,screen.Y-center.Y
+                            local score=dx*dx+dy*dy
+                            if score<bestScore then
+                                local clear=true
+                                if a.wallCheck=="On" then
+                                    local params=RaycastParams.new()
+                                    params.FilterType=Enum.RaycastFilterType.Exclude
+                                    params.FilterDescendantsInstances={me.Character,camera}
+                                    local direction=position-camera.CFrame.Position
+                                    local hit=workspace:Raycast(camera.CFrame.Position,direction,params)
+                                    clear=(hit==nil or hit.Instance:IsDescendantOf(character))
+                                end
+                                if clear then
+                                    bestPart,bestPos,bestScore=part,position,score
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return bestPart,bestPos
+end
+-- Install a single reusable compatibility hook per executor session. The
+-- original index handler remains in place; unload disables this hook's effect.
+function extra.aim.enableLegacyHook()
+    local a=extra.aim
+    local shared=globalEnv.ZAXLegacyMouseHook
+    if type(shared)=="table" and shared.installed then
+        shared.active=true
+        shared.getAim=extra.aim.aimPoint
+        a.hookState=shared
+        return true
+    end
+    if type(hookmetamethod)~="function" then return false end
+    local mouse=me:GetMouse()
+    if not mouse then return false end
+    shared={installed=false,active=false,mouse=mouse,getAim=extra.aim.aimPoint}
+    local oldIndex
+    local wrapper=function(self,key)
+        if shared.active and self==shared.mouse and (key=="Hit" or key=="Target") then
+            local caller=false
+            if type(checkcaller)=="function" then
+                local ok,result=pcall(checkcaller)
+                caller=ok and result or false
+            end
+            if not caller then
+                local part,position=shared.getAim()
+                if part and position then
+                    if key=="Target" then return part end
+                    if key=="Hit" then return CFrame.new(position) end
+                end
+            end
+        end
+        return oldIndex(self,key)
+    end
+    local ok,previous=pcall(function()
+        return hookmetamethod(game,"__index",
+            type(newcclosure)=="function" and newcclosure(wrapper) or wrapper)
+    end)
+    if not ok or type(previous)~="function" then return false end
+    oldIndex=previous
+    shared.installed=true
+    shared.active=true
+    globalEnv.ZAXLegacyMouseHook=shared
+    a.hookState=shared
+    return true
+end
+extra.aim.ring=create("Frame",{
+    Name="AimFOV",Visible=false,BackgroundTransparency=1,
+    BorderSizePixel=0,Active=false,ZIndex=5,
+    Size=UDim2.fromOffset(360,360),
+},gui)
+create("UICorner",{CornerRadius=UDim.new(1,0)},extra.aim.ring)
+extra.aim.ringStroke=stroke(extra.aim.ring,C.mint,.15,2)
+
+-- Tool cards are quiet by default; reveal controls only when requested.
+local cardIndex={MAIN=0,MOVEMENT=0,VISUALS=0,THEMES=0,SETTINGS=0}
+local featureCards={}
+local function section(tab,title,detail)
+    cardIndex[tab]=cardIndex[tab]+1
+    local wrap=create("Frame",{
+        LayoutOrder=cardIndex[tab],Size=UDim2.fromOffset(543,55),
+        BackgroundTransparency=1,
+    },pages[tab])
+    create("TextLabel",{Position=UDim2.fromOffset(3,6),Size=UDim2.fromOffset(532,21),
+        BackgroundTransparency=1,Text=title,Font=Enum.Font.GothamBold,
+        TextSize=12,TextColor3=C.text,TextXAlignment=Enum.TextXAlignment.Left,
+    },wrap)
+    create("TextLabel",{Position=UDim2.fromOffset(3,28),Size=UDim2.fromOffset(532,18),
+        BackgroundTransparency=1,Text=detail,Font=Enum.Font.Gotham,
+        TextSize=11,TextColor3=C.dim,TextXAlignment=Enum.TextXAlignment.Left,
+    },wrap)
+end
+local function action(tab,glyph,title,description,color,callback)
+    cardIndex[tab]=cardIndex[tab]+1
+    local card=rounded(create("Frame",{
+        LayoutOrder=cardIndex[tab],Size=UDim2.fromOffset(543,82),
+        BackgroundColor3=C.card,BackgroundTransparency=surfaceOpacity*.48,
+        BorderSizePixel=0,ClipsDescendants=true,
+    },pages[tab]),13)
+    local outline=stroke(card,C.stroke,.72)
+    local logo=rounded(create("Frame",{
+        Position=UDim2.fromOffset(15,20),Size=UDim2.fromOffset(42,42),
+        BackgroundColor3=C.rail,BorderSizePixel=0,
+    },card),11)
+    local logoStroke=stroke(logo,color,.80)
+    create("TextLabel",{Size=UDim2.fromScale(1,1),Text=glyph,
+        BackgroundTransparency=1,Font=Enum.Font.GothamBold,TextSize=11,
+        TextColor3=color},logo)
+    create("TextLabel",{Position=UDim2.fromOffset(71,14),
+        Size=UDim2.fromOffset(307,23),Text=title,
+        Font=Enum.Font.GothamBold,TextSize=14,TextColor3=C.text,
+        BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left},card)
+    create("TextLabel",{Position=UDim2.fromOffset(71,38),
+        Size=UDim2.fromOffset(307,30),Text=description,
+        Font=Enum.Font.Gotham,TextSize=11,TextWrapped=true,
+        TextColor3=C.dim,BackgroundTransparency=1,
+        TextXAlignment=Enum.TextXAlignment.Left},card)
+    local primary=rounded(create("TextButton",{
+        Position=UDim2.fromOffset(396,23),Size=UDim2.fromOffset(90,35),
+        Text="RUN",Font=Enum.Font.GothamBold,TextSize=11,
+        TextColor3=C.canvas,BackgroundColor3=C.mint,
+        BorderSizePixel=0,AutoButtonColor=false,
+    },card),10)
+    local expand=rounded(create("TextButton",{
+        Position=UDim2.fromOffset(494,23),Size=UDim2.fromOffset(36,35),
+        Text="",BackgroundColor3=C.rail,
+        BorderSizePixel=0,AutoButtonColor=false,
+    },card),10)
+    stroke(expand,C.stroke,.60)
+    -- Draw arrows with 2 rotated Frames: never render as missing glyph boxes.
+    local function chevron(parent,x,y)
+        local holder=create("Frame",{
+            Position=UDim2.fromOffset(x,y),Size=UDim2.fromOffset(14,14),
+            BackgroundTransparency=1,BorderSizePixel=0,
+        },parent)
+        local a=rounded(create("Frame",{
+            Position=UDim2.fromOffset(1,5),Size=UDim2.fromOffset(8,2),
+            BackgroundColor3=C.dim,BorderSizePixel=0,Rotation=45,
+        },holder),1)
+        local b=rounded(create("Frame",{
+            Position=UDim2.fromOffset(6,5),Size=UDim2.fromOffset(8,2),
+            BackgroundColor3=C.dim,BorderSizePixel=0,Rotation=-45,
+        },holder),1)
+        return function(up)
+            a.Rotation=up and -45 or 45
+            b.Rotation=up and 45 or -45
+        end
+    end
+    local setExpandArrow=chevron(expand,11,11)
+    local divider=create("Frame",{
+        Position=UDim2.fromOffset(17,83),Size=UDim2.fromOffset(508,1),
+        BackgroundColor3=C.stroke,BackgroundTransparency=.64,
+        BorderSizePixel=0,Visible=false,
+    },card)
+    -- Numeric settings use freely adjustable sliders. Non-numeric settings
+    -- use inline segmented buttons (no menus or floating dropdowns).
+    local rows={}
+    local refreshes={}
+    local expanded=false
+    local function positionRows()
+        if not expanded then
+            for _,r in ipairs(rows) do r.container.Visible=false end
+            divider.Visible=false
+            card.Size=UDim2.fromOffset(543,82)
+            setExpandArrow(false)
+            return
+        end
+        setExpandArrow(true)
+        divider.Visible=true
+        local y=96
+        for _,r in ipairs(rows) do
+            r.container.Position=UDim2.fromOffset(18,y)
+            r.container.Visible=true
+            r.refresh()
+            y=y+r.height+8
+        end
+        -- UIListLayout on the page makes the next card follow this card's size.
+        card.Size=UDim2.fromOffset(543,y+6)
+    end
+    local function addSetting(label,spec,get,set)
+        local isSlider=type(spec)=="table" and spec.type=="slider"
+        local row={height=isSlider and 82 or 79}
+        row.container=create("Frame",{
+            Size=UDim2.fromOffset(507,row.height),Visible=false,
+            BackgroundTransparency=1,BorderSizePixel=0,
+        },card)
+        create("TextLabel",{
+            Position=UDim2.fromOffset(1,1),Size=UDim2.fromOffset(336,24),
+            BackgroundTransparency=1,Text=label:upper(),
+            Font=Enum.Font.GothamBold,TextSize=10,TextColor3=C.dim,
+            TextXAlignment=Enum.TextXAlignment.Left,
+        },row.container)
+        if isSlider then
+            local min,max=spec.min,spec.max
+            local step=spec.step or 1
+            local display=spec.display or function(v) return tostring(v) end
+            local valueBox=rounded(create("TextBox",{
+                Position=UDim2.fromOffset(364,0),Size=UDim2.fromOffset(141,28),
+                BackgroundColor3=C.rail,TextColor3=C.text,
+                Font=Enum.Font.GothamBold,TextSize=11,Text=tostring(display(get())),
+                TextXAlignment=Enum.TextXAlignment.Center,
+                ClearTextOnFocus=false,BorderSizePixel=0,
+            },row.container),8)
+            stroke(valueBox,C.stroke,.68)
+            local track=rounded(create("TextButton",{
+                Position=UDim2.fromOffset(7,39),Size=UDim2.fromOffset(493,10),
+                BackgroundColor3=C.rail,BorderSizePixel=0,
+                Text="",AutoButtonColor=false,Active=true,
+            },row.container),6)
+            local fill=rounded(create("Frame",{
+                Size=UDim2.fromScale(0,1),BackgroundColor3=C.mint,
+                BorderSizePixel=0,
+            },track),6)
+            local thumb=rounded(create("TextButton",{
+                AnchorPoint=Vector2.new(.5,.5),
+                Position=UDim2.fromScale(0,.5),Size=UDim2.fromOffset(17,19),
+                BackgroundColor3=C.text,BorderSizePixel=0,
+                Text="",AutoButtonColor=false,ZIndex=3,
+            },track),6)
+            stroke(thumb,C.canvas,.40)
+            create("TextLabel",{
+                Position=UDim2.fromOffset(5,54),Size=UDim2.fromOffset(170,17),
+                BackgroundTransparency=1,Text=tostring(display(min)),
+                TextColor3=C.dim,Font=Enum.Font.Gotham,TextSize=10,
+                TextXAlignment=Enum.TextXAlignment.Left,
+            },row.container)
+            create("TextLabel",{
+                Position=UDim2.fromOffset(328,54),Size=UDim2.fromOffset(174,17),
+                BackgroundTransparency=1,Text=tostring(display(max)),
+                TextColor3=C.dim,Font=Enum.Font.Gotham,TextSize=10,
+                TextXAlignment=Enum.TextXAlignment.Right,
+            },row.container)
+            local function normalize(v)
+                v=math.clamp(v,min,max)
+                v=min+math.floor((v-min)/step+.5)*step
+                return math.clamp(math.floor(v*10000+.5)/10000,min,max)
+            end
+            row.refresh=function()
+                if not valueBox.Parent then return end
+                local v=math.clamp(tonumber(get()) or min,min,max)
+                local ratio=(max>min) and (v-min)/(max-min) or 0
+                fill.Size=UDim2.fromScale(ratio,1)
+                thumb.Position=UDim2.fromScale(ratio,.5)
+                if not valueBox:IsFocused() then
+                    valueBox.Text=tostring(display(v))
+                end
+            end
+            local function updateFromX(x)
+                if not alive then return end
+                local width=math.max(track.AbsoluteSize.X,1)
+                local ratio=math.clamp((x-track.AbsolutePosition.X)/width,0,1)
+                set(normalize(min+(max-min)*ratio))
+                row.refresh()
+            end
+            local dragType=nil
+            local function beginDrag(input)
+                if input.UserInputType==Enum.UserInputType.MouseButton1 or
+                    input.UserInputType==Enum.UserInputType.Touch then
+                    dragType=input.UserInputType
+                    updateFromX(input.Position.X)
+                end
+            end
+            on(track.InputBegan,beginDrag)
+            on(thumb.InputBegan,beginDrag)
+            on(UIS.InputChanged,function(input)
+                if not dragType then return end
+                if (dragType==Enum.UserInputType.Touch and
+                    input.UserInputType==Enum.UserInputType.Touch) or
+                    (dragType==Enum.UserInputType.MouseButton1 and
+                    input.UserInputType==Enum.UserInputType.MouseMovement) then
+                    updateFromX(input.Position.X)
+                end
+            end)
+            on(UIS.InputEnded,function(input)
+                if input.UserInputType==dragType then dragType=nil end
+            end)
+            on(valueBox.FocusLost,function()
+                local raw=valueBox.Text or ""
+                local num=tonumber(raw:match("^%s*(%-?%.%d+)") or
+                    raw:match("%-?%d+%.?%d*"))
+                if num and spec.inputScale and num>max then
+                    num=num/spec.inputScale
+                end
+                if num then set(normalize(num)) end
+                row.refresh()
+            end)
+        else
+            -- A categorical setting cannot meaningfully be a numeric slider.
+            -- Show all available choices in one clean segmented row.
+            local choices=spec
+            local count=#choices
+            local gap=6
+            local buttonWidth=(503-gap*(count-1))/count
+            local buttons={}
+            for i,option in ipairs(choices) do
+                local name=type(option)=="table" and option.label or option
+                local value=type(option)=="table" and option.value or option
+                local btn=rounded(create("TextButton",{
+                    Position=UDim2.fromOffset((i-1)*(buttonWidth+gap)+2,31),
+                    Size=UDim2.fromOffset(buttonWidth,33),
+                    Text=tostring(name),Font=Enum.Font.GothamMedium,
+                    TextSize=11,TextColor3=C.dim,
+                    BackgroundColor3=C.rail,BorderSizePixel=0,
+                    AutoButtonColor=false,
+                },row.container),8)
+                stroke(btn,C.stroke,.76)
+                buttons[i]={button=btn,value=value}
+                on(btn.MouseButton1Click,function()
+                    if not alive then return end
+                    set(value)
+                    row.refresh()
+                end)
+            end
+            row.refresh=function()
+                for _,option in ipairs(buttons) do
+                    local active=get()==option.value
+                    option.button.BackgroundColor3=active and C.badge or C.rail
+                    option.button.TextColor3=active and C.mint or C.dim
+                end
+            end
+        end
+        table.insert(rows,row)
+        table.insert(refreshes,row.refresh)
+        row.refresh()
+        positionRows()
+    end
+    on(expand.MouseButton1Click,function()
+        expanded=not expanded
+        positionRows()
+    end)
+    on(primary.MouseButton1Click,function()
+        if alive and callback then callback() end
+    end)
+    on(card.MouseEnter,function()
+        if alive then
+            animate(outline,.16,{Transparency=extra.edge.softenedAlpha(.36)})
+            animate(card,.16,{BackgroundColor3=C.hover})
+        end
+    end)
+    on(card.MouseLeave,function()
+        if alive then
+            animate(outline,.16,{Transparency=extra.edge.softenedAlpha(.72)})
+            animate(card,.16,{BackgroundColor3=C.card})
+        end
+    end)
+    table.insert(featureCards,{card=card,expand=expand,settingsRefreshes=refreshes})
+    return primary,addSetting
+end
+
+-- Core toolkit: movement and vision tools preserved; target tab replaced with Main.
+-- Local movement and vision tools. These are not server permissions.
+local function restoreMovement()
+    if hum and hum.Parent then
+        pcall(function()
+            if originalSpeed then hum.WalkSpeed=originalSpeed end
+            if originalJumpPower then hum.JumpPower=originalJumpPower end
+            if originalJumpHeight then hum.JumpHeight=originalJumpHeight end
+        end)
+    end
+end
+local function removeFlightObjects()
+    if flyVelocity then pcall(function() flyVelocity:Destroy() end) end
+    if flyGyro then pcall(function() flyGyro:Destroy() end) end
+    flyVelocity=nil
+    flyGyro=nil
+    if flyRoot and flyRoot.Parent then
+        pcall(function() flyRoot.AssemblyLinearVelocity=Vector3.zero end)
+    end
+    if flyHumanoid and flyHumanoid.Parent then
+        if prevPlatform~=nil then flyHumanoid.PlatformStand=prevPlatform end
+        if prevAutoRotate~=nil then flyHumanoid.AutoRotate=prevAutoRotate end
+    end
+    flyRoot=nil
+    extra.flightCurrentVelocity=nil
+    flyHumanoid=nil
+    prevPlatform=nil
+    prevAutoRotate=nil
+end
+setFly=function(value)
+    if not value then
+        flyActive=false
+        removeFlightObjects()
+        if refreshToggles then refreshToggles() end
+        message("Fly disabled","Normal movement restored")
+        return
+    end
+    if flyActive then return end
+    if not selfReady() then message("Fly unavailable","Wait for your character") return end
+    if contactBusy then message("Fly unavailable","Finish the physics attempt first") return end
+    local r, h=root,hum
+    flyRoot=r
+    flyHumanoid=h
+    prevPlatform=h.PlatformStand
+    prevAutoRotate=h.AutoRotate
+    local velocity=Instance.new("BodyVelocity")
+    velocity.Name="NOX_FlightVelocity"
+    velocity.MaxForce=Vector3.new(1e8,1e8,1e8)
+    velocity.Velocity=Vector3.zero
+    velocity.P=18000
+    velocity.Parent=r
+    local gyro=Instance.new("BodyGyro")
+    gyro.Name="NOX_FlightGyro"
+    gyro.MaxTorque=Vector3.new(1e8,1e8,1e8)
+    gyro.P=13000
+    gyro.D=500
+    gyro.CFrame=r.CFrame
+    gyro.Parent=r
+    flyVelocity,flyGyro=velocity,gyro
+    extra.flightCurrentVelocity=Vector3.zero
+    h.PlatformStand=true
+    h.AutoRotate=false
+    flyActive=true
+    if refreshToggles then refreshToggles() end
+    message("Fly enabled","WASD move / Space up / Ctrl down")
+end
+local function restoreNoclip()
+    for part,value in pairs(noclipParts) do
+        if part.Parent then pcall(function() part.CanCollide=value end) end
+        noclipParts[part]=nil
+    end
+end
+local function setNoclip(value)
+    noclipActive=value
+    if not value then restoreNoclip() end
+    message(value and "Noclip enabled" or "Noclip disabled",
+        "Local collisions only; server rules still apply")
+end
+local function setSpeed(value)
+    speedActive=value
+    if not value and hum and hum.Parent and originalSpeed then
+        hum.WalkSpeed=originalSpeed
+    end
+    message(value and "Speed enabled" or "Speed disabled",
+        value and ("WalkSpeed: "..walkSpeedValue) or "WalkSpeed restored")
+end
+local function setJump(value)
+    jumpActive=value
+    if not value and hum and hum.Parent then
+        if originalJumpPower then hum.JumpPower=originalJumpPower end
+        if originalJumpHeight then hum.JumpHeight=originalJumpHeight end
+    end
+    message(value and "Jump boost enabled" or "Jump boost disabled",
+        "Jump strength: "..jumpPowerValue)
+end
+local function removeVisual(p)
+    local rec=espItems[p]
+    if not rec then return end
+    -- Never destroy the other player's Character; only locally created overlays.
+    if rec.highlight then pcall(function() rec.highlight:Destroy() end) end
+    if rec.billboard then pcall(function() rec.billboard:Destroy() end) end
+    espItems[p]=nil
+end
+local function clearVisuals()
+    for p in pairs(espItems) do removeVisual(p) end
+end
+local function updateVisuals()
+    if not (chamsActive or namesActive or distancesActive) then
+        clearVisuals()
+        return
+    end
+    local present={}
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p~=me then
+            present[p]=true
+            local otherChar=p.Character
+            local otherHum=otherChar and otherChar:FindFirstChildOfClass("Humanoid")
+            local head=otherChar and otherChar:FindFirstChild("Head")
+            local otherRoot=otherChar and otherChar:FindFirstChild("HumanoidRootPart")
+            local sameTeam=teamCheckActive and ((me.Team~=nil and p.Team==me.Team)
+                or (teamFilterMode=="teamneutral" and p.Neutral and me.Neutral))
+            if not otherChar or not otherHum or otherHum.Health<=0 or sameTeam then
+                removeVisual(p)
+            else
+                local rec=espItems[p]
+                if rec and rec.character~=otherChar then
+                    removeVisual(p)
+                    rec=nil
+                end
+                if not rec then
+                    rec={character=otherChar}
+                    espItems[p]=rec
+                end
+                local targetDistance=(root and root.Parent and otherRoot)
+                    and (root.Position-otherRoot.Position).Magnitude or nil
+                local showChams=chamsActive and
+                    (extra.chamsRange==0 or not targetDistance or targetDistance<=extra.chamsRange)
+                if showChams then
+                    if not rec.highlight or not rec.highlight.Parent then
+                        local mark=Instance.new("Highlight")
+                        mark.Name="NOX_Chams"
+                        mark.Adornee=otherChar
+                        mark.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop
+                        mark.FillTransparency=chamsOpacity
+                        mark.OutlineTransparency=extra.chamsOutlineOpacity
+                        mark.Parent=otherChar
+                        rec.highlight=mark
+                    end
+                    local teamColor=(p.Team and p.TeamColor and p.TeamColor.Color) or C.mint
+                    rec.highlight.FillColor=extra.chamsColorMode=="Team" and teamColor or C.mint
+                    rec.highlight.OutlineColor=extra.chamsColorMode=="Team" and teamColor or C.blue
+                    rec.highlight.FillTransparency=chamsOpacity
+                    rec.highlight.OutlineTransparency=extra.chamsOutlineOpacity
+                    rec.highlight.DepthMode=chamDepth=="Through Walls"
+                        and Enum.HighlightDepthMode.AlwaysOnTop
+                        or Enum.HighlightDepthMode.Occluded
+                elseif rec.highlight then
+                    rec.highlight:Destroy()
+                    rec.highlight=nil
+                end
+                if (namesActive or distancesActive) and head then
+                    if not rec.billboard or not rec.billboard.Parent or rec.head~=head then
+                        if rec.billboard then rec.billboard:Destroy() end
+                        local board=Instance.new("BillboardGui")
+                        board.Name="NOX_PlayerESP"
+                        board.Adornee=head
+                        board.AlwaysOnTop=extra.espThroughWalls=="On"
+                        board.Size=UDim2.fromOffset(230,53)
+                        board.StudsOffsetWorldSpace=Vector3.new(0,extra.nameVerticalOffset,0)
+                        board.Parent=playerGui
+                        local display=Instance.new("TextLabel")
+                        display.Name="NameText"
+                        display.Size=UDim2.fromOffset(230,30)
+                        display.BackgroundTransparency=1
+                        display.TextStrokeTransparency=.3
+                        display.Font=Enum.Font.GothamBold
+                        display.TextSize=12
+                        display.Parent=board
+                        local distance=Instance.new("TextLabel")
+                        distance.Name="DistanceText"
+                        distance.Position=UDim2.fromOffset(0,30)
+                        distance.Size=UDim2.fromOffset(230,21)
+                        distance.BackgroundTransparency=1
+                        distance.TextStrokeTransparency=.3
+                        distance.Font=Enum.Font.GothamMedium
+                        distance.TextSize=10
+                        distance.Parent=board
+                        rec.billboard=board
+                        rec.head=head
+                    end
+                    local nameText=rec.billboard:FindFirstChild("NameText")
+                    local distanceText=rec.billboard:FindFirstChild("DistanceText")
+                    if rec.billboard then
+                        rec.billboard.StudsOffsetWorldSpace=Vector3.new(0,extra.nameVerticalOffset,0)
+                        rec.billboard.AlwaysOnTop=extra.espThroughWalls=="On"
+                    end
+                    if nameText then
+                        nameText.TextStrokeTransparency=extra.espStrokeTransparency
+                        nameText.Visible=namesActive and
+                            (extra.nameRange==0 or not targetDistance or
+                                targetDistance<=extra.nameRange)
+                        local username=(nameFormat=="Username" and "@"..p.Name)
+                            or (nameFormat=="Display Name" and p.DisplayName)
+                            or (p.DisplayName.."  [@"..p.Name.."]")
+                        if extra.nameShowHealth=="On" then
+                            username=username.."  "..math.floor(otherHum.Health/math.max(otherHum.MaxHealth,1)*100+.5).."% HP"
+                        end
+                        nameText.Text=username
+                        nameText.TextSize=extra.nameTextSize
+                        nameText.TextColor3=C.text
+                    end
+                    if distanceText then
+                        distanceText.TextStrokeTransparency=extra.espStrokeTransparency
+                        distanceText.Visible=distancesActive
+                        local distance=(root and root.Parent and otherRoot)
+                            and math.floor((root.Position-otherRoot.Position).Magnitude) or -1
+                        local shownDistance=distance>=0 and
+                            math.floor(distance/extra.distanceRounding+.5)*extra.distanceRounding or -1
+                        distanceText.Text=(shownDistance>=0 and
+                            (distanceLimit==0 or distance<=distanceLimit)
+                            and tostring(shownDistance).." studs" or "")
+                        distanceText.TextSize=extra.distanceTextSize
+                        distanceText.TextColor3=C.mint
+                    end
+                elseif rec.billboard then
+                    rec.billboard:Destroy()
+                    rec.billboard=nil
+                    rec.head=nil
+                end
+            end
+        end
+    end
+    for p in pairs(espItems) do
+        if not present[p] then removeVisual(p) end
+    end
+end
+-- Responsive 2D Box ESP (local-only).
+-- Position updates happen every rendered frame so boxes track the camera/characters.
+-- Expensive GetBoundingBox calls are cached per character and refreshed periodically.
+do
+    local previousLayer=playerGui:FindFirstChild("ZAX_PlayerOverlay2D")
+    if previousLayer then previousLayer:Destroy() end
+    local layer=Instance.new("ScreenGui")
+    layer.Name="ZAX_PlayerOverlay2D"
+    layer.ResetOnSpawn=false
+    layer.IgnoreGuiInset=true
+    layer.DisplayOrder=15
+    layer.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+    layer.Parent=playerGui
+    local records={}
+
+    local function remove(p)
+        local item=records[p]
+        if not item then return end
+        if item.frame then item.frame:Destroy() end
+        records[p]=nil
+    end
+    function extra.overlay.clear()
+        for p in pairs(records) do remove(p) end
+    end
+    function extra.overlay.destroy()
+        extra.overlay.clear()
+        if layer.Parent then layer:Destroy() end
+    end
+    local function recordFor(p,model)
+        local item=records[p]
+        if item and item.model==model then return item end
+        if item then remove(p) end
+        local outlineFrame=Instance.new("Frame")
+        outlineFrame.Name="ZAX_BoxESP"
+        outlineFrame.BackgroundTransparency=1
+        outlineFrame.BorderSizePixel=0
+        outlineFrame.Visible=false
+        outlineFrame.Parent=layer
+        local outline=Instance.new("UIStroke")
+        outline.Color=C.mint
+        outline.Thickness=extra.overlay.boxWidth
+        outline.Parent=outlineFrame
+        item={model=model,frame=outlineFrame,stroke=outline,
+            relativeBounds=nil,boundsSize=nil,nextBoundsAt=0}
+        records[p]=item
+        return item
+    end
+
+    local function getCachedBounds(item,model,targetRoot,now)
+        if item.boundsSize and now<item.nextBoundsAt then return true end
+        -- Cache geometry relative to the target root, so movement and camera
+        -- tracking don't require GetBoundingBox on every frame.
+        item.nextBoundsAt=now+extra.overlay.boundsRefresh
+        local ok,cf,size=pcall(function() return model:GetBoundingBox() end)
+        if ok and cf and size then
+            item.relativeBounds=targetRoot.CFrame:ToObjectSpace(cf)
+            item.boundsSize=size
+            return true
+        end
+        return item.relativeBounds~=nil
+    end
+
+    function extra.overlay.update(dt)
+        local opt=extra.overlay
+        if not alive then return end
+        if not opt.boxes then
+            if next(records) then opt.clear() end
+            return
+        end
+        local camera=workspace.CurrentCamera
+        if not camera then return end
+        local viewport=camera.ViewportSize
+        local now=os.clock()
+        local seen={}
+        for _,p in ipairs(Players:GetPlayers()) do
+            if p~=me then
+                seen[p]=true
+                local model=p.Character
+                local targetRoot=model and model:FindFirstChild("HumanoidRootPart")
+                local targetHum=model and model:FindFirstChildOfClass("Humanoid")
+                local sameTeam=teamCheckActive and ((me.Team~=nil and p.Team==me.Team)
+                    or (teamFilterMode=="teamneutral" and p.Neutral and me.Neutral))
+                local distance=(root and root.Parent and targetRoot)
+                    and (root.Position-targetRoot.Position).Magnitude or nil
+                if not model or not targetRoot or not targetHum or targetHum.Health<=0
+                    or sameTeam or not distance or (opt.boxRange~=0 and distance>opt.boxRange) then
+                    remove(p)
+                else
+                    local item=recordFor(p,model)
+                    item.stroke.Color=(opt.colorMode=="Team" and p.Team and p.TeamColor.Color) or C.mint
+                    item.stroke.Thickness=opt.boxWidth
+                    -- Calculate geometry infrequently; project using the live root
+                    -- transform every frame to remove visible lag during running.
+                    local boundsReady=getCachedBounds(item,model,targetRoot,now)
+                    local center,onScreen=camera:WorldToViewportPoint(targetRoot.Position)
+                    item.frame.Visible=false
+                    if boundsReady and center.Z>0 and onScreen then
+                        local cf=targetRoot.CFrame*item.relativeBounds
+                        local size=item.boundsSize
+                        local minX,minY,maxX,maxY=math.huge,math.huge,-math.huge,-math.huge
+                        local allInFront=true
+                        for sx=-1,1,2 do
+                            for sy=-1,1,2 do
+                                for sz=-1,1,2 do
+                                    local corner=cf:PointToWorldSpace(Vector3.new(
+                                        size.X*sx*.5,size.Y*sy*.5,size.Z*sz*.5))
+                                    local screen=camera:WorldToViewportPoint(corner)
+                                    if screen.Z<=0 then allInFront=false end
+                                    minX=math.min(minX,screen.X)
+                                    minY=math.min(minY,screen.Y)
+                                    maxX=math.max(maxX,screen.X)
+                                    maxY=math.max(maxY,screen.Y)
+                                end
+                            end
+                        end
+                        local width,height=maxX-minX,maxY-minY
+                        if allInFront and width>1 and height>1
+                            and width<viewport.X*3 and height<viewport.Y*3 then
+                            item.frame.Position=UDim2.fromOffset(minX,minY)
+                            item.frame.Size=UDim2.fromOffset(width,height)
+                            item.frame.Visible=true
+                        end
+                    end
+                end
+            end
+        end
+        for p in pairs(records) do
+            if not seen[p] then remove(p) end
+        end
+    end
+end
+
+local toggleWidgets={}
+refreshToggles=function()
+    for _,item in ipairs(toggleWidgets) do
+        local enabled=item.get()
+        item.button.Text=enabled and "ON" or "OFF"
+        item.button.BackgroundColor3=enabled and C.mint or C.rail
+        item.button.TextColor3=enabled and C.canvas or C.dim
+    end
+end
+local function toggleAction(tab,glyph,title,description,color,get,set)
+    local button,addSetting=action(tab,glyph,title,description,color,function()
+        set(not get())
+        refreshToggles()
+    end)
+    table.insert(toggleWidgets,{button=button,get=get})
+    refreshToggles()
+    return addSetting
+end
+
+-- Feature card builders are scoped: event callbacks retain only needed settings.
+local unload
+do
+-- MAIN / three carefully scoped additions. The former target-physics card
+-- is removed; all other feature cards remain in place.
+section("MAIN","01  /  AIM CONTROLS","Aim and FOV settings for the local player")
+local aimConfig=toggleAction("MAIN","AM","Aimbot",
+    "Camera tracking toward the closest eligible target",C.mint,
+    function() return extra.aim.enabled end,
+    function(v)
+        extra.aim.enabled=v
+        message(v and "Aimbot enabled" or "Aimbot disabled",
+            v and "Hold right mouse button or change activation mode" or "Camera control released")
+    end)
+aimConfig("Activation",{"Hold Right Mouse","Always"},
+    function() return extra.aim.activation end,
+    function(v) extra.aim.activation=v end)
+aimConfig("Aim Smoothness",{type="slider",min=5,max=100,step=1,
+    display=function(v) return tostring(math.floor(v)).."%" end},
+    function() return extra.aim.smooth end,
+    function(v) extra.aim.smooth=v end)
+aimConfig("Target Part",{"Head","UpperTorso","HumanoidRootPart"},
+    function() return extra.aim.part end,
+    function(v) extra.aim.part=v end)
+aimConfig("Prediction",{type="slider",min=0,max=.3,step=.01,
+    display=function(v) return string.format("%.2fs",v) end},
+    function() return extra.aim.prediction end,
+    function(v) extra.aim.prediction=v end)
+aimConfig("Team Filter",{"On","Off"},
+    function() return extra.aim.teamFilter end,
+    function(v) extra.aim.teamFilter=v end)
+aimConfig("Line of Sight",{"On","Off"},
+    function() return extra.aim.wallCheck end,
+    function(v) extra.aim.wallCheck=v end)
+aimConfig("Max Target Range",{type="slider",min=0,max=2000,step=25,
+    display=function(v) return v==0 and "Unlimited" or math.floor(v).." studs" end},
+    function() return extra.aim.maxDistance end,
+    function(v) extra.aim.maxDistance=v end)
+
+local silentConfig=toggleAction("MAIN","SA","Silent Aim  /  LEGACY",
+    "Mouse.Hit/Target compatibility; game and executor dependent",C.blue,
+    function() return extra.aim.silent end,
+    function(v)
+        if not v then
+            extra.aim.silent=false
+            if extra.aim.hookState then extra.aim.hookState.active=false end
+            message("Legacy silent aim off","Mouse override disabled")
+        elseif extra.aim.enableLegacyHook() then
+            extra.aim.silent=true
+            message("Legacy hook enabled","May work with Mouse.Hit based weapons only")
+        else
+            extra.aim.silent=false
+            message("Not supported","This environment lacks the required mouse-hook API")
+        end
+    end)
+silentConfig("Target Part",{"Head","UpperTorso","HumanoidRootPart"},
+    function() return extra.aim.part end,
+    function(v) extra.aim.part=v end)
+silentConfig("Prediction",{type="slider",min=0,max=.3,step=.01,
+    display=function(v) return string.format("%.2fs",v) end},
+    function() return extra.aim.prediction end,
+    function(v) extra.aim.prediction=v end)
+
+local fovConfig=toggleAction("MAIN","FV","Show FOV",
+    "Display a fixed FOV circle at the center of your screen",C.orange,
+    function() return extra.aim.showFov end,
+    function(v) extra.aim.showFov=v end)
+fovConfig("FOV Radius",{type="slider",min=40,max=700,step=5,
+    display=function(v) return tostring(math.floor(v)).." px" end},
+    function() return extra.aim.radius end,
+    function(v) extra.aim.radius=v end)
+fovConfig("Circle Thickness",{type="slider",min=1,max=5,step=.25,
+    display=function(v) return string.format("%.2f px",v) end},
+    function() return extra.aim.strokeWidth end,
+    function(v) extra.aim.strokeWidth=v end)
+fovConfig("Circle Opacity",{type="slider",min=10,max=100,step=5,
+    display=function(v) return tostring(math.floor(v)).."%" end},
+    function() return extra.aim.circleOpacity end,
+    function(v) extra.aim.circleOpacity=v end)
+
+section("MOVEMENT","01  /  CHARACTER MOVEMENT","Each tool has its own settings drawer")
+local flyConfig=toggleAction("MOVEMENT","FY","Fly Mode",
+    "WASD move  •  Space up  •  Ctrl down",C.mint,
+    function() return flyActive end,setFly)
+flyConfig("Flight Speed",{type="slider",min=10,max=200,step=1,
+    display=function(v) return math.floor(v+.5).." studs/s" end},
+    function() return flySpeed end,function(v) flySpeed=v end)
+flyConfig("Vertical Speed",{type="slider",min=25,max=250,step=5,
+    display=function(v) return math.floor(v+.5).."%" end},
+    function() return extra.flightVerticalPercent end,
+    function(v) extra.flightVerticalPercent=v end)
+flyConfig("Descent Speed",{type="slider",min=25,max=200,step=5,
+    display=function(v) return math.floor(v+.5).."%" end},
+    function() return extra.flightDescendPercent end,
+    function(v) extra.flightDescendPercent=v end)
+flyConfig("Boost Key",{"Shift","Alt"},
+    function() return extra.flightBoostKey end,
+    function(v) extra.flightBoostKey=v end)
+flyConfig("Boost Multiplier",{type="slider",min=1,max=3,step=.05,
+    display=function(v) return string.format("%.2fx",v) end},
+    function() return extra.flightBoost end,
+    function(v) extra.flightBoost=v end)
+flyConfig("Movement Smoothing",{type="slider",min=0,max=90,step=5,
+    display=function(v) return math.floor(v+.5).."%" end},
+    function() return extra.flightSmoothing end,
+    function(v) extra.flightSmoothing=v end)
+flyConfig("Character Facing",{"Camera","Travel Direction"},
+    function() return extra.flightFacing end,
+    function(v) extra.flightFacing=v end)
+
+-- v2 feature 1: hold Ctrl or Alt and click a surface to teleport your character.
+do
+    local teleportConfig=toggleAction("MOVEMENT","TP","Click Teleport",
+        "Hold the selected key and click the ground to move",C.blue,
+        function() return extra.clickTeleportEnabled end,
+        function(v)
+            extra.clickTeleportEnabled=v
+            message(v and "Click teleport enabled" or "Click teleport disabled",
+                v and ("Hold "..extra.clickTeleportModifier.." and click a surface") or "Teleport tool stopped")
+        end)
+    teleportConfig("Activation Key",{"Ctrl","Alt"},
+        function() return extra.clickTeleportModifier end,
+        function(v) extra.clickTeleportModifier=v end)
+    teleportConfig("Landing Height",{type="slider",min=2,max=12,step=.5,
+        display=function(v) return string.format("%.1f studs",v) end},
+        function() return extra.clickTeleportHeight end,
+        function(v) extra.clickTeleportHeight=v end)
+    teleportConfig("Maximum Distance",{type="slider",min=0,max=2000,step=25,
+        display=function(v) return v==0 and "Unlimited" or math.floor(v).." studs" end},
+        function() return extra.clickTeleportMaxDistance end,
+        function(v) extra.clickTeleportMaxDistance=v end)
+end
+
+local noclipConfig=toggleAction("MOVEMENT","NC","Noclip",
+    "Move through local collision geometry",C.blue,
+    function() return noclipActive end,setNoclip)
+noclipConfig("Collision Scope",{"All Parts","Body Only"},
+    function() return noclipScope end,function(v)
+        restoreNoclip()
+        noclipScope=v
+    end)
+noclipConfig("Accessory Collision",{"Include","Exclude"},
+    function() return extra.noclipAccessories end,
+    function(v)
+        restoreNoclip()
+        extra.noclipAccessories=v
+    end)
+
+local speedConfig=toggleAction("MOVEMENT","SP","Speed Boost",
+    "Adjust your character's local WalkSpeed",C.orange,
+    function() return speedActive end,setSpeed)
+speedConfig("Walk Speed",{type="slider",min=16,max=120,step=1},
+    function() return walkSpeedValue end,function(v) walkSpeedValue=v end)
+speedConfig("Sprint Multiplier",{type="slider",min=1,max=3,step=.05,
+    display=function(v) return string.format("%.2fx",v) end},
+    function() return extra.sprintMultiplier end,
+    function(v) extra.sprintMultiplier=v end)
+speedConfig("Sprint Mode",{"Hold","Always"},
+    function() return extra.sprintMode end,
+    function(v) extra.sprintMode=v end)
+speedConfig("Sprint Key",{"Shift","Alt"},
+    function() return extra.sprintKey end,
+    function(v) extra.sprintKey=v end)
+
+local jumpConfig=toggleAction("MOVEMENT","JP","Jump Boost",
+    "Adjust jump strength on your local character",C.mint,
+    function() return jumpActive end,setJump)
+jumpConfig("Jump Power",{type="slider",min=35,max=180,step=1},
+    function() return jumpPowerValue end,function(v)
+        jumpPowerValue=v
+    end)
+jumpConfig("Jump Height",{type="slider",min=5,max=60,step=.5,
+    display=function(v) return string.format("%.1f studs",v) end},
+    function() return extra.jumpHeight end,
+    function(v) extra.jumpHeight=v; jumpHeightValue=v end)
+
+local multiJumpConfig=toggleAction("MOVEMENT","IJ","Infinite Jump",
+    "Press Space for extra jumps while airborne",C.blue,
+    function() return infiniteJumpActive end,function(v)
+        infiniteJumpActive=v
+        message(v and "Infinite jump enabled" or "Infinite jump disabled",
+            "Use Space for extra jumps")
+    end)
+multiJumpConfig("Repeat Interval",{type="slider",min=0,max=.75,step=.01,
+    display=function(v) return v==0 and "Instant" or string.format("%.2fs",v) end},
+function() return jumpGap end,
+function(v) jumpGap=v end)
+multiJumpConfig("Air Jump Power",{type="slider",min=20,max=140,step=5},
+    function() return extra.airJumpVelocity end,
+    function(v) extra.airJumpVelocity=v end)
+multiJumpConfig("Max Air Jumps",{type="slider",min=0,max=10,step=1,
+    display=function(v) return v==0 and "Unlimited" or tostring(v) end},
+    function() return extra.maxAirJumps end,
+    function(v) extra.maxAirJumps=v end)
+
+section("VISUALS","01  /  PLAYER OVERLAYS","Only you can see these overlays")
+-- Tracers removed; Box ESP is updated on RenderStepped for smooth tracking.
+
+do
+    local boxConfig=toggleAction("VISUALS","BX","Box ESP",
+        "Screen-space boxes around visible player characters",C.blue,
+        function() return extra.overlay.boxes end,
+        function(v) extra.overlay.boxes=v; if not v then extra.overlay.clear() end end)
+    boxConfig("Outline Thickness",{type="slider",min=1,max=5,step=1,
+        display=function(v) return tostring(v).." px" end},
+        function() return extra.overlay.boxWidth end,
+        function(v) extra.overlay.boxWidth=v end)
+    boxConfig("Maximum Range",{type="slider",min=0,max=3000,step=50,
+        display=function(v) return v==0 and "Unlimited" or math.floor(v).." studs" end},
+        function() return extra.overlay.boxRange end,
+        function(v) extra.overlay.boxRange=v end)
+    boxConfig("Outline Color",{"Theme","Team"},
+        function() return extra.overlay.colorMode end,
+        function(v) extra.overlay.colorMode=v end)
+end
+
+local chamsConfig=toggleAction("VISUALS","CH","Chams / Highlights",
+    "Highlight player characters using Roblox Highlight",C.mint,
+    function() return chamsActive end,function(v) chamsActive=v;updateVisuals() end)
+chamsConfig("Max Highlight Range",{type="slider",min=0,max=2500,step=25,
+    display=function(v) return v==0 and "Unlimited" or math.floor(v+.5).." studs" end},
+    function() return extra.chamsRange end,
+    function(v) extra.chamsRange=v;updateVisuals() end)
+chamsConfig("Fill Transparency",{type="slider",min=0,max=1,step=.01,inputScale=100,
+    display=function(v) return math.floor(v*100+.5).."%" end},
+function() return chamsOpacity end,
+function(v) chamsOpacity=v;updateVisuals() end)
+chamsConfig("Visibility",{"Through Walls","Visible Only"},
+    function() return chamDepth end,function(v) chamDepth=v;updateVisuals() end)
+chamsConfig("Outline Transparency",{type="slider",min=0,max=1,step=.01,inputScale=100,
+    display=function(v) return math.floor(v*100+.5).."%" end},
+    function() return extra.chamsOutlineOpacity end,
+    function(v) extra.chamsOutlineOpacity=v;updateVisuals() end)
+chamsConfig("Highlight Color",{"Theme","Team"},
+    function() return extra.chamsColorMode end,
+    function(v) extra.chamsColorMode=v;updateVisuals() end)
+
+local namesConfig=toggleAction("VISUALS","NM","Name ESP",
+    "Show player identity labels above heads",C.blue,
+    function() return namesActive end,function(v) namesActive=v;updateVisuals() end)
+namesConfig("Name Style",{"Both","Display Name","Username"},
+    function() return nameFormat end,function(v) nameFormat=v;updateVisuals() end)
+namesConfig("Max Name Range",{type="slider",min=0,max=2500,step=25,
+    display=function(v) return v==0 and "Unlimited" or math.floor(v+.5).." studs" end},
+    function() return extra.nameRange end,
+    function(v) extra.nameRange=v;updateVisuals() end)
+namesConfig("Labels Through Walls",{"On","Off"},
+    function() return extra.espThroughWalls end,
+    function(v) extra.espThroughWalls=v;updateVisuals() end)
+namesConfig("Text Stroke Transparency",{type="slider",min=0,max=1,step=.05,
+    display=function(v) return math.floor(v*100+.5).."%" end},
+    function() return extra.espStrokeTransparency end,
+    function(v) extra.espStrokeTransparency=v;updateVisuals() end)
+namesConfig("Name Text Size",{type="slider",min=9,max=20,step=1},
+    function() return extra.nameTextSize end,
+    function(v) extra.nameTextSize=v;updateVisuals() end)
+namesConfig("Show Health Percent",{"Off","On"},
+    function() return extra.nameShowHealth end,
+    function(v) extra.nameShowHealth=v;updateVisuals() end)
+namesConfig("Label Height",{type="slider",min=1,max=5,step=.1,
+    display=function(v) return string.format("%.1f studs",v) end},
+    function() return extra.nameVerticalOffset end,
+    function(v) extra.nameVerticalOffset=v;updateVisuals() end)
+
+local distanceConfig=toggleAction("VISUALS","DS","Distance ESP",
+    "Distance labels in studs above players",C.orange,
+    function() return distancesActive end,function(v) distancesActive=v;updateVisuals() end)
+distanceConfig("Max Label Range",{type="slider",min=0,max=2000,step=10,
+    display=function(v) return v==0 and "Unlimited" or math.floor(v+.5).." studs" end},
+function() return distanceLimit end,
+function(v) distanceLimit=v;updateVisuals() end)
+distanceConfig("Distance Text Size",{type="slider",min=9,max=20,step=1},
+    function() return extra.distanceTextSize end,
+    function(v) extra.distanceTextSize=v;updateVisuals() end)
+distanceConfig("Distance Rounding",{
+    {label="Exact",value=1},{label="5 studs",value=5},{label="10 studs",value=10}
+},function() return extra.distanceRounding end,
+function(v) extra.distanceRounding=v;updateVisuals() end)
+
+local teamConfig=toggleAction("VISUALS","TC","Team Check",
+    "Hide teammates from Chams and ESP",C.mint,
+    function() return teamCheckActive end,function(v)
+        teamCheckActive=v
+        updateVisuals()
+    end)
+teamConfig("Filter Mode",{
+    {label="Team Filter",value="team"},
+    {label="Team + Neutral",value="teamneutral"},
+},function() return teamFilterMode end,
+function(v) teamFilterMode=v;updateVisuals() end)
+
+section("SETTINGS","01  /  SYSTEM CONTROLS","Reset, privacy and session management")
+local resetButton, resetConfig=action("SETTINGS","RS","Reset Tools",
+    "Restore movement and optionally clear visual overlays",C.orange,function()
+        contactToken=contactToken+1
+        if contactBusy then restoreContact() end
+        if flyActive then setFly(false) end
+        if noclipActive then setNoclip(false) end
+        if speedActive then setSpeed(false) end
+        if jumpActive then setJump(false) end
+        infiniteJumpActive=false
+        restoreMovement()
+        extra.clickTeleportEnabled=false
+        if resetScope=="Movement + Visuals" then
+            chamsActive=false
+            namesActive=false
+            distancesActive=false
+            teamCheckActive=false
+            clearVisuals()
+            extra.overlay.boxes=false
+            extra.overlay.clear()
+        end
+        refreshToggles()
+        message("Reset complete",resetScope.." restored")
+    end)
+resetConfig("Reset Scope",{"Movement Only","Movement + Visuals"},
+    function() return resetScope end,function(v) resetScope=v end)
+
+local infoButton,infoConfig=action("SETTINGS","IN","Help / Information",
+    "Replication and control notes",C.blue,function()
+        if infoTopic=="Controls" then
+            message("Controls","Right Shift: UI / WASD + Space + Ctrl: fly")
+        elseif infoTopic=="Themes" then
+            message("Themes","Presets and custom colors are in the Themes tab")
+        else
+            message("Replication","Physics varies by game; Chams and ESP are local")
+        end
+    end)
+infoConfig("Help Topic",{"Replication","Controls","Themes"},
+    function() return infoTopic end,function(v) infoTopic=v end)
+
+section("SETTINGS","02  /  PREFERENCES","Tune UI feedback and visual performance")
+local prefsButton,prefsConfig=action("SETTINGS","PF","Performance & UI",
+    "Live overlay refresh, notifications, and window scale",C.mint,function()
+        message("Preferences","Use the arrow to edit performance and UI settings")
+    end)
+prefsConfig("Corner Roundness",{type="slider",min=.75,max=1.85,step=.05,
+    display=function(v) return math.floor(v*100+.5).."%" end},
+    function() return extra.cornerRoundness end,
+    function(v) extra.cornerRoundness=v;extra.edge.applyStyle();extra.saveUiStyle() end)
+prefsConfig("Border Softness",{type="slider",min=0,max=85,step=5,
+    display=function(v) return math.floor(v+.5).."%" end},
+    function() return extra.borderSoftness end,
+    function(v) extra.borderSoftness=v;extra.edge.applyStyle();extra.saveUiStyle() end)
+prefsConfig("Interface Motion",{"On","Off"},
+    function() return extra.uiMotion end,
+    function(v) extra.uiMotion=v;extra.saveUiStyle() end)
+prefsConfig("Toast Duration",{type="slider",min=1,max=7,step=.5,
+    display=function(v) return string.format("%.1fs",v) end},
+    function() return extra.toastDuration end,
+    function(v) extra.toastDuration=v;extra.saveUiStyle() end)
+prefsConfig("ESP Refresh Interval",{type="slider",min=.1,max=1.5,step=.05,
+    display=function(v) return string.format("%.2fs",v) end},
+    function() return extra.espRefreshRate end,
+    function(v) extra.espRefreshRate=v end)
+prefsConfig("Popup Notifications",{"On","Off"},
+    function() return extra.notifications end,
+    function(v) extra.notifications=v end)
+prefsConfig("Window Scale",{type="slider",min=.65,max=1,step=.05,inputScale=100,
+    display=function(v) return math.floor(v*100+.5).."%" end},
+    function() return extra.uiScale end,
+    function(v)
+        extra.uiScale=v
+        local camera=workspace.CurrentCamera
+        if camera then
+            local viewport=camera.ViewportSize
+            local scale=math.clamp(math.min(1,(viewport.X-32)/1050,(viewport.Y-32)/656)
+                *extra.uiScale,.45,1)
+            local currentWindow=gui:FindFirstChild("NOXWindow")
+            if currentWindow then
+                local scaler=currentWindow:FindFirstChildOfClass("UIScale")
+                if scaler then scaler.Scale=scale end
+                currentWindow.Position=UDim2.new(.5,-525*scale,.5,-328*scale)
+            end
+            local shadowScaler=backdrop:FindFirstChildOfClass("UIScale")
+            if shadowScaler then shadowScaler.Scale=scale end
+            backdrop.Position=currentWindow.Position+UDim2.fromOffset(5,6)
+        end
+    end)
+
+local unloadButton,unloadConfig=action("SETTINGS","XX","Unload Hub",
+    "Disconnect tools, restore settings and remove the UI",C.pink,function()
+        if unloadConfirm=="On" and not unloadArmed then
+            unloadArmed=true
+            message("Confirm unload","Click Unload again to exit")
+            return
+        end
+        if unload then unload() end
+    end)
+unloadConfig("Confirm Before Unload",{"Off","On"},
+    function() return unloadConfirm end,function(v)
+        unloadConfirm=v
+        unloadArmed=false
+    end)
+
+end
+
+-- THEME STUDIO: coordinated presets, then two precise live sliders.
+local themePage=pages.THEMES
+local themeGrid=rounded(create("Frame",{
+    LayoutOrder=1,Size=UDim2.fromOffset(543,303),
+    BackgroundColor3=C.panel,BackgroundTransparency=surfaceOpacity*.6,BorderSizePixel=0,
+},themePage),14)
+stroke(themeGrid,C.stroke,.72)
+create("TextLabel",{
+    Position=UDim2.fromOffset(20,15),Size=UDim2.fromOffset(500,23),
+    Text="Theme collection",TextColor3=C.text,
+    Font=Enum.Font.GothamBold,TextSize=15,
+    TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
+},themeGrid)
+create("TextLabel",{
+    Position=UDim2.fromOffset(20,39),Size=UDim2.fromOffset(500,19),
+    Text="Pick one coordinated palette for the whole interface.",
+    TextColor3=C.dim,Font=Enum.Font.Gotham,TextSize=11,
+    TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
+},themeGrid)
+local paletteTiles={}
+local staticPreviewObjects=setmetatable({}, {__mode="k"})
+for index,name in ipairs(paletteNames) do
+    local px=16+((index-1)%2)*260
+    local py=69+math.floor((index-1)/2)*75
+    local tile=rounded(create("TextButton",{
+        Position=UDim2.fromOffset(px,py),Size=UDim2.fromOffset(251,66),
+        BackgroundColor3=C.card,BorderSizePixel=0,Text="",
+        AutoButtonColor=false,
+    },themeGrid),11)
+    local outline=stroke(tile,C.stroke,.7)
+    local raw=palettes[name]
+    local accent=hexColor(raw.mint)
+    local sample=rounded(create("Frame",{
+        Position=UDim2.fromOffset(11,12),Size=UDim2.fromOffset(45,42),
+        BackgroundColor3=hexColor(raw.canvas),BorderSizePixel=0,
+    },tile),8)
+    rounded(create("Frame",{
+        Position=UDim2.fromOffset(6,6),Size=UDim2.fromOffset(33,7),
+        BackgroundColor3=accent,BorderSizePixel=0,
+    },sample),3)
+    rounded(create("Frame",{
+        Position=UDim2.fromOffset(6,18),Size=UDim2.fromOffset(12,17),
+        BackgroundColor3=hexColor(raw.card),BorderSizePixel=0,
+    },sample),3)
+    rounded(create("Frame",{
+        Position=UDim2.fromOffset(21,18),Size=UDim2.fromOffset(18,17),
+        BackgroundColor3=hexColor(raw.panel),BorderSizePixel=0,
+    },sample),3)
+    themedObjects[sample]=nil
+    staticPreviewObjects[sample]=true
+    for _,part in ipairs(sample:GetDescendants()) do
+        themedObjects[part]=nil
+        staticPreviewObjects[part]=true
+    end
+    create("TextLabel",{
+        Position=UDim2.fromOffset(69,12),Size=UDim2.fromOffset(171,22),
+        Text=name,TextColor3=C.text,Font=Enum.Font.GothamBold,
+        TextSize=13,TextXAlignment=Enum.TextXAlignment.Left,
+        BackgroundTransparency=1,
+    },tile)
+    create("TextLabel",{
+        Position=UDim2.fromOffset(69,36),Size=UDim2.fromOffset(167,18),
+        Text=(index==1 and "GRAPHITE") or (index==2 and "LAVENDER") or
+            (index==3 and "ARCTIC BLUE") or (index==4 and "SOFT PINK") or
+            (index==5 and "BOTANICAL") or "WARM GOLD",
+        TextColor3=C.dim,Font=Enum.Font.GothamMedium,TextSize=10,
+        TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
+    },tile)
+    paletteTiles[name]={tile=tile,outline=outline}
+end
+local colorStudio=rounded(create("Frame",{
+    LayoutOrder=2,Size=UDim2.fromOffset(543,202),
+    BackgroundColor3=C.panel,BackgroundTransparency=surfaceOpacity*.6,BorderSizePixel=0,
+},themePage),14)
+stroke(colorStudio,C.stroke,.72)
+create("TextLabel",{
+    Position=UDim2.fromOffset(20,15),Size=UDim2.fromOffset(314,23),
+    Text="Custom accent",TextColor3=C.text,
+    Font=Enum.Font.GothamBold,TextSize=15,
+    TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
+},colorStudio)
+local hexLabel=rounded(create("TextLabel",{
+    Position=UDim2.fromOffset(385,13),Size=UDim2.fromOffset(137,25),
+    Text=colorHex(C.mint),TextColor3=C.mint,
+    Font=Enum.Font.GothamBold,TextSize=11,
+    BackgroundColor3=C.card,BorderSizePixel=0,
+},colorStudio),8)
+create("TextLabel",{
+    Position=UDim2.fromOffset(20,49),Size=UDim2.fromOffset(375,17),
+    Text="HUE",TextColor3=C.dim,Font=Enum.Font.GothamBold,
+    TextSize=10,TextXAlignment=Enum.TextXAlignment.Left,
+    BackgroundTransparency=1,
+},colorStudio)
+local hueBar=rounded(create("Frame",{
+    Position=UDim2.fromOffset(21,76),Size=UDim2.fromOffset(501,12),
+    BackgroundColor3=C.card,BorderSizePixel=0,Active=true,
+},colorStudio),8)
+create("UIGradient",{
+    Color=ColorSequence.new({
+        ColorSequenceKeypoint.new(0,Color3.fromHSV(0,1,1)),
+        ColorSequenceKeypoint.new(1/6,Color3.fromHSV(1/6,1,1)),
+        ColorSequenceKeypoint.new(2/6,Color3.fromHSV(2/6,1,1)),
+        ColorSequenceKeypoint.new(3/6,Color3.fromHSV(3/6,1,1)),
+        ColorSequenceKeypoint.new(4/6,Color3.fromHSV(4/6,1,1)),
+        ColorSequenceKeypoint.new(5/6,Color3.fromHSV(5/6,1,1)),
+        ColorSequenceKeypoint.new(1,Color3.fromHSV(1,1,1)),
+    }),
+},hueBar)
+local hueKnob=rounded(create("TextButton",{
+    Position=UDim2.fromScale(accentHue,.5),AnchorPoint=Vector2.new(.5,.5),
+    Size=UDim2.fromOffset(17,22),Text="",AutoButtonColor=false,
+    BackgroundColor3=C.text,BorderSizePixel=0,ZIndex=3,
+},hueBar),6)
+stroke(hueKnob,C.canvas,.26,1.5)
+create("TextLabel",{
+    Position=UDim2.fromOffset(20,109),Size=UDim2.fromOffset(380,17),
+    Text="COLOR INTENSITY",TextColor3=C.dim,
+    Font=Enum.Font.GothamBold,TextSize=10,
+    TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
+},colorStudio)
+local saturationBar=rounded(create("Frame",{
+    Position=UDim2.fromOffset(21,136),Size=UDim2.fromOffset(501,12),
+    BackgroundColor3=C.card,BorderSizePixel=0,Active=true,
+},colorStudio),8)
+local saturationGradient=create("UIGradient",{
+    Color=ColorSequence.new(Color3.fromHSV(accentHue,0,1),
+        Color3.fromHSV(accentHue,1,1)),
+},saturationBar)
+local satKnob=rounded(create("TextButton",{
+    Position=UDim2.fromScale((accentSaturation-.18)/.82,.5),
+    AnchorPoint=Vector2.new(.5,.5),Size=UDim2.fromOffset(17,22),
+    Text="",AutoButtonColor=false,BackgroundColor3=C.text,
+    BorderSizePixel=0,ZIndex=3,
+},saturationBar),6)
+stroke(satKnob,C.canvas,.26,1.5)
+local customLabel=create("TextLabel",{
+    Position=UDim2.fromOffset(20,168),Size=UDim2.fromOffset(500,23),
+    Text="Drag either slider to customize the accent",
+    TextColor3=C.dim,Font=Enum.Font.Gotham,TextSize=11,
+    TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
+},colorStudio)
+-- Glass opacity control: changes only panel opacity, never text opacity.
+local glassStudio=rounded(create("Frame",{
+    LayoutOrder=3,Size=UDim2.fromOffset(543,105),
+    BackgroundColor3=C.panel,BackgroundTransparency=surfaceOpacity*.6,
+    BorderSizePixel=0,
+},themePage),14)
+stroke(glassStudio,C.stroke,.72)
+create("TextLabel",{
+    Position=UDim2.fromOffset(20,12),Size=UDim2.fromOffset(340,24),
+    Text="Window transparency",Font=Enum.Font.GothamBold,
+    TextColor3=C.text,TextSize=15,BackgroundTransparency=1,
+    TextXAlignment=Enum.TextXAlignment.Left,
+},glassStudio)
+local glassValue=create("TextLabel",{
+    Position=UDim2.fromOffset(415,13),Size=UDim2.fromOffset(108,24),
+    Text=math.floor(surfaceOpacity*100+.5).."%",TextColor3=C.mint,
+    Font=Enum.Font.GothamBold,TextSize=12,BackgroundTransparency=1,
+    TextXAlignment=Enum.TextXAlignment.Right,
+},glassStudio)
+local glassBar=rounded(create("Frame",{
+    Position=UDim2.fromOffset(21,61),Size=UDim2.fromOffset(501,10),
+    BackgroundColor3=C.card,BorderSizePixel=0,Active=true,
+},glassStudio),5)
+local glassFill=rounded(create("Frame",{
+    Size=UDim2.fromScale(surfaceOpacity/.32,1),
+    BackgroundColor3=C.mint,BorderSizePixel=0,
+},glassBar),5)
+local glassKnob=rounded(create("TextButton",{
+    Position=UDim2.fromScale(surfaceOpacity/.32,.5),
+    AnchorPoint=Vector2.new(.5,.5),Size=UDim2.fromOffset(16,18),
+    Text="",AutoButtonColor=false,BackgroundColor3=C.text,
+    BorderSizePixel=0,ZIndex=3,
+},glassBar),6)
+stroke(glassKnob,C.canvas,.35)
+local glassSurfaces={{window,1},{left,.78},{sidePanel,.65},
+    {contextPanel,.65},{themeGrid,.6},{colorStudio,.6},{glassStudio,.6}}
+for _,ui in ipairs(featureCards) do
+    table.insert(glassSurfaces,{ui.card,.48})
+end
+local function applyGlassOpacity()
+    for _,item in ipairs(glassSurfaces) do
+        if item[1].Parent then
+            item[1].BackgroundTransparency=surfaceOpacity*item[2]
+        end
+    end
+    glassValue.Text=math.floor(surfaceOpacity*100+.5).."%"
+    local ratio=surfaceOpacity/.32
+    glassFill.Size=UDim2.fromScale(ratio,1)
+    glassKnob.Position=UDim2.fromScale(ratio,.5)
+end
+local draggingGlass=false
+local function setGlassFromX(x)
+    local ratio=math.clamp((x-glassBar.AbsolutePosition.X)/
+        math.max(1,glassBar.AbsoluteSize.X),0,1)
+    surfaceOpacity=math.floor(ratio*32+.5)/100
+    applyGlassOpacity()
+    globalEnv.CreamysChaosLabThemeGraphite={preset=paletteName,
+        hue=accentHue,saturation=accentSaturation,
+        custom=customAccent,opacity=surfaceOpacity}
+end
+local function startGlassDrag(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton1 or
+        input.UserInputType==Enum.UserInputType.Touch then
+        draggingGlass=true
+        setGlassFromX(input.Position.X)
+    end
+end
+on(glassBar.InputBegan,startGlassDrag)
+on(glassKnob.InputBegan,startGlassDrag)
+on(UIS.InputChanged,function(input)
+    if draggingGlass and (input.UserInputType==Enum.UserInputType.MouseMovement
+        or input.UserInputType==Enum.UserInputType.Touch) then
+        setGlassFromX(input.Position.X)
+    end
+end)
+on(UIS.InputEnded,function(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton1
+        or input.UserInputType==Enum.UserInputType.Touch then
+        draggingGlass=false
+    end
+end)
+
+local themeNote=rounded(create("Frame",{
+    LayoutOrder=4,Size=UDim2.fromOffset(543,58),
+    BackgroundColor3=C.badge,BackgroundTransparency=surfaceOpacity*.44,BorderSizePixel=0,
+},themePage),12)
+create("TextLabel",{
+    Position=UDim2.fromOffset(18,10),Size=UDim2.fromOffset(510,39),
+    Text="Changes apply instantly. Theme settings persist while this session is open.",
+    TextColor3=C.text,Font=Enum.Font.GothamMedium,TextSize=11,
+    TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,
+    BackgroundTransparency=1,
+},themeNote)
+
+table.insert(glassSurfaces,{themeNote,.44})
+
+local function saveTheme()
+    globalEnv.CreamysChaosLabThemeGraphite={preset=paletteName,hue=accentHue,
+        saturation=accentSaturation,custom=customAccent,opacity=surfaceOpacity}
+end
+local function updateColorStudio()
+    themeChip.Text="THEME  /  "..string.upper(paletteName)..
+        (customAccent and " + CUSTOM" or "")
+    hexLabel.Text=colorHex(C.mint)
+    hueKnob.Position=UDim2.fromScale(accentHue,.5)
+    satKnob.Position=UDim2.fromScale((accentSaturation-.18)/.82,.5)
+    saturationGradient.Color=ColorSequence.new(
+        Color3.fromHSV(accentHue,0,1),Color3.fromHSV(accentHue,1,1))
+    customLabel.Text=customAccent and
+        "LIVE CUSTOM COLOR  /  Adjust sliders freely" or
+        "PRESET ACTIVE  /  Drag a slider to customize"
+    for name,ui in pairs(paletteTiles) do
+        local selectedTile=name==paletteName
+        ui.outline.Color=selectedTile and C.mint or C.stroke
+        ui.outline.Transparency=selectedTile and .1 or .7
+        ui.tile.BackgroundColor3=selectedTile and C.badge or C.card
+    end
+end
+local function applyTheme()
+    local oldColors={}
+    for role,value in pairs(C) do oldColors[role]=value end
+    local nextColors=buildPalette(paletteName)
+    for role,value in pairs(nextColors) do C[role]=value end
+    -- The explicit registry handles regular UI objects. The fallback below
+    -- also catches accents changed by runtime events / tweens before a theme
+    -- switch, without touching fixed preview swatches or other games' UI.
+    for object,roles in pairs(themedObjects) do
+        if object.Parent then
+            for prop,role in pairs(roles) do
+                pcall(function() object[prop]=C[role] end)
+            end
+        end
+    end
+    for grad,roles in pairs(themedGradients) do
+        if grad.Parent then
+            grad.Color=ColorSequence.new(C[roles[1]],C[roles[2]])
+        end
+    end
+    for _,object in ipairs(gui:GetDescendants()) do
+        if not staticPreviewObjects[object] then
+            local registry=themedObjects[object]
+            for _,prop in ipairs(themeColorProps) do
+                if not (registry and registry[prop]) then
+                    local ok,current=pcall(function() return object[prop] end)
+                    if ok and current~=nil then
+                        for _,role in ipairs(themeRoles) do
+                            if current==oldColors[role] then
+                                pcall(function() object[prop]=C[role] end)
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    -- Active states have their own colors; reapply after the general palette.
+    if refreshToggles then refreshToggles() end
+    for _,item in ipairs(featureCards) do
+        for _,refresh in ipairs(item.settingsRefreshes) do refresh() end
+    end
+    for id,ui in pairs(navButtons) do
+        ui.button.BackgroundColor3=id==activePage and C.badge or C.rail
+        ui.text.TextColor3=id==activePage and C.text or C.dim
+        ui.indicator.BackgroundTransparency=id==activePage and 0 or 1
+    end
+    updateColorStudio()
+    applyGlassOpacity()
+    extra.edge.applyStyle()
+    saveTheme()
+end
+for name,ui in pairs(paletteTiles) do
+    on(ui.tile.MouseButton1Click,function()
+        paletteName=name
+        customAccent=false
+        accentHue,accentSaturation=hexColor(palettes[name].mint):ToHSV()
+        applyTheme()
+        message("Palette applied",name.." theme enabled")
+    end)
+    on(ui.tile.MouseEnter,function()
+        if alive and paletteName~=name then
+            animate(ui.tile,.13,{BackgroundColor3=C.hover})
+        end
+    end)
+    on(ui.tile.MouseLeave,function()
+        if alive then
+            animate(ui.tile,.13,{BackgroundColor3=paletteName==name and C.badge or C.card})
+        end
+    end)
+end
+local draggingHue=false
+local draggingSat=false
+local function updateAccentFromInput(bar,x,isHue)
+    if not alive then return end
+    local ratio=math.clamp((x-bar.AbsolutePosition.X)/
+        math.max(1,bar.AbsoluteSize.X),0,1)
+    if isHue then
+        accentHue=ratio
+    else
+        accentSaturation=.18+ratio*.82
+    end
+    customAccent=true
+    applyTheme()
+end
+local function beginHue(input,isHue)
+    if input.UserInputType==Enum.UserInputType.MouseButton1 or
+        input.UserInputType==Enum.UserInputType.Touch then
+        if isHue then draggingHue=true else draggingSat=true end
+        updateAccentFromInput(isHue and hueBar or saturationBar,
+            input.Position.X,isHue)
+    end
+end
+on(hueBar.InputBegan,function(input) beginHue(input,true) end)
+on(hueKnob.InputBegan,function(input) beginHue(input,true) end)
+on(saturationBar.InputBegan,function(input) beginHue(input,false) end)
+on(satKnob.InputBegan,function(input) beginHue(input,false) end)
+on(UIS.InputChanged,function(input)
+    if input.UserInputType~=Enum.UserInputType.MouseMovement and
+        input.UserInputType~=Enum.UserInputType.Touch then return end
+    if draggingHue then updateAccentFromInput(hueBar,input.Position.X,true) end
+    if draggingSat then updateAccentFromInput(saturationBar,input.Position.X,false) end
+end)
+on(UIS.InputEnded,function(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton1 or
+        input.UserInputType==Enum.UserInputType.Touch then
+        draggingHue=false
+        draggingSat=false
+    end
+end)
+updateColorStudio()
+
+-- Navigation: minimal active pill and text, no decorative icon tiles.
+local function chooseTab(name)
+    activePage=name
+    for id,page in pairs(pages) do page.Visible=(id==name) end
+    pageTitle.Text=pageNames[name][1]
+    pageSub.Text=pageNames[name][2]
+    sidePanel.Visible=false
+    contextPanel.Visible=true
+    local context=contextContents[name]
+    if context then
+        contextMark.Text=context.icon
+        contextTitle.Text=context.title
+        contextBody.Text=context.body
+    end
+    for id,ui in pairs(navButtons) do
+        animate(ui.button,.15,{BackgroundColor3=id==name and C.badge or C.rail})
+        animate(ui.text,.15,{TextColor3=id==name and C.text or C.dim})
+        animate(ui.indicator,.15,{BackgroundTransparency=id==name and 0 or 1})
+    end
+end
+for i,name in ipairs(navList) do
+    local nav=rounded(create("TextButton",{
+        Position=UDim2.fromOffset(13,140+(i-1)*56),
+        Size=UDim2.fromOffset(168,47),
+        BackgroundColor3=C.rail,BorderSizePixel=0,
+        Text="",AutoButtonColor=false,
+    },left),10)
+    local indicator=rounded(create("Frame",{
+        Position=UDim2.fromOffset(0,12),Size=UDim2.fromOffset(3,24),
+        BackgroundColor3=C.mint,BackgroundTransparency=1,
+        BorderSizePixel=0,
+    },nav),2)
+    local navNames={MAIN="Aim",MOVEMENT="Movement",VISUALS="Visuals",
+        THEMES="Appearance",SETTINGS="Settings"}
+    local navNums={MAIN="01",MOVEMENT="02",VISUALS="03",THEMES="04",SETTINGS="05"}
+    create("TextLabel",{
+        Position=UDim2.fromOffset(16,0),Size=UDim2.fromOffset(26,47),
+        Text=navNums[name],Font=Enum.Font.GothamBold,TextSize=11,
+        TextColor3=C.mint,BackgroundTransparency=1,
+        TextXAlignment=Enum.TextXAlignment.Left,
+    },nav)
+    local label=create("TextLabel",{
+        Position=UDim2.fromOffset(46,0),Size=UDim2.fromOffset(116,47),
+        Text=navNames[name],TextColor3=C.dim,
+        Font=Enum.Font.GothamMedium,TextSize=12,
+        TextXAlignment=Enum.TextXAlignment.Left,
+        BackgroundTransparency=1,
+    },nav)
+    navButtons[name]={button=nav,indicator=indicator,text=label}
+    on(nav.MouseButton1Click,function() chooseTab(name) end)
+    on(nav.MouseEnter,function()
+        if alive and activePage~=name then
+            animate(nav,.14,{BackgroundColor3=C.card})
+        end
+    end)
+    on(nav.MouseLeave,function()
+        if alive and activePage~=name then
+            animate(nav,.14,{BackgroundColor3=C.rail})
+        end
+    end)
+end
+
+chooseTab("MAIN")
+
+-- Roster and target selection
+on(targetBox:GetPropertyChangedSignal("Text"),function()
+    searchText=targetBox.Text:match("^%s*(.-)%s*$") or ""
+    if selected and not playerMatches(selected,string.lower(searchText)) then selected=nil end
+    refreshRoster()
+    displaySelected()
+end)
+on(targetBox.FocusLost,function()
+    if searchText=="" then return end
+    local p=validTarget()
+    if p and p~=selected then selectTarget(p) refreshRoster() end
+end)
+on(randomButton.MouseButton1Click,function()
+    local choices={}
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p~=me then table.insert(choices,p) end
+    end
+    if #choices==0 then message("Empty server","Nobody else is in this server") return end
+    selectTarget(choices[math.random(1,#choices)])
+    refreshRoster()
+end)
+on(Players.PlayerAdded,refreshRoster)
+on(Players.PlayerRemoving,function(p)
+    if p==selected then
+        selected=nil
+        searchText=""
+        targetBox.Text=""
+        displaySelected()
+        message("Player left","Choose another target")
+    end
+    task.defer(refreshRoster)
+end)
+refreshRoster()
+displaySelected()
+
+-- Keybinds / hide / show
+local opener=rounded(create("TextButton", {
+    Name="Launcher",Position=UDim2.new(0,20,.5,-22),
+    Size=UDim2.fromOffset(112,44),BackgroundColor3=C.panel,
+    Text="ZAX  /  OPEN",Font=Enum.Font.GothamBold,TextSize=11,
+    TextColor3=C.mint,BorderSizePixel=0,Visible=false,
+},gui),11)
+stroke(opener,C.mint,.45)
+local function setVisible(v)
+    shown=v
+    window.Visible=v
+    backdrop.Visible=v
+    opener.Visible=not v
+end
+on(opener.MouseButton1Click,function() setVisible(true) end)
+on(close.MouseButton1Click,function() setVisible(false) end)
+on(keyButton.MouseButton1Click,function()
+    rebinding=true
+    keyButton.Text="PRESS ANY KEY"
+end)
+on(UIS.InputBegan,function(input,handled)
+    if input.UserInputType~=Enum.UserInputType.Keyboard then return end
+    if rebinding then
+        rebinding=false
+        if input.KeyCode~=Enum.KeyCode.Escape and input.KeyCode~=Enum.KeyCode.Unknown then
+            toggleKey=input.KeyCode
+        end
+        keyButton.Text="KEY: "..string.upper(toggleKey.Name)
+        return
+    end
+    if handled or UIS:GetFocusedTextBox() then return end
+    if input.KeyCode==toggleKey then setVisible(not shown) end
+end)
+on(restore.MouseButton1Click,function()
+    contactToken=contactToken+1
+    if contactBusy then restoreContact() end
+    if flyActive then setFly(false) end
+    if noclipActive then setNoclip(false) end
+    if speedActive then setSpeed(false) end
+    if jumpActive then setJump(false) end
+    infiniteJumpActive=false
+    restoreMovement()
+    extra.clickTeleportEnabled=false
+    refreshToggles()
+    message("Movement reset","All movement tools disabled")
+end)
+
+-- v2 click-teleport handler. Never trigger on buttons/textboxes.
+on(UIS.InputBegan,function(input,processed)
+    if not alive or not extra.clickTeleportEnabled then return end
+    if processed or UIS:GetFocusedTextBox() or flyActive or contactBusy then return end
+    if input.UserInputType~=Enum.UserInputType.MouseButton1 then return end
+    local modifier=extra.clickTeleportModifier
+    local held
+    if modifier=="Alt" then
+        held=UIS:IsKeyDown(Enum.KeyCode.LeftAlt) or UIS:IsKeyDown(Enum.KeyCode.RightAlt)
+    else
+        held=UIS:IsKeyDown(Enum.KeyCode.LeftControl) or UIS:IsKeyDown(Enum.KeyCode.RightControl)
+    end
+    if not held or not selfReady() then return end
+    local camera=workspace.CurrentCamera
+    if not camera then return end
+    local mouse=UIS:GetMouseLocation()
+    local ray=camera:ViewportPointToRay(mouse.X,mouse.Y)
+    local params=RaycastParams.new()
+    params.FilterType=Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances={char}
+    local hit=workspace:Raycast(ray.Origin,ray.Direction*3000,params)
+    if not hit then
+        message("Click teleport","No surface under the cursor")
+        return
+    end
+    local destination=hit.Position+Vector3.new(0,extra.clickTeleportHeight,0)
+    local maxDistance=extra.clickTeleportMaxDistance
+    if maxDistance>0 and (destination-root.Position).Magnitude>maxDistance then
+        message("Click teleport","Destination exceeds your range setting")
+        return
+    end
+    local rotation=root.CFrame-root.CFrame.Position
+    root.CFrame=CFrame.new(destination)*rotation
+end)
+
+-- Draggable header, works with mouse or touch
+local dragging=false
+local dragOrigin,windowOrigin,dragKind
+on(mainHeader.InputBegan,function(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton1 or
+       input.UserInputType==Enum.UserInputType.Touch then
+        dragging=true
+        dragOrigin=input.Position
+        windowOrigin=window.Position
+        dragKind=input.UserInputType
+    end
+end)
+on(UIS.InputChanged,function(input)
+    if not dragging then return end
+    if input.UserInputType~=Enum.UserInputType.MouseMovement and
+       input.UserInputType~=Enum.UserInputType.Touch then return end
+    if dragKind==Enum.UserInputType.Touch and input.UserInputType~=dragKind then return end
+    local offset=input.Position-dragOrigin
+    window.Position=UDim2.new(windowOrigin.X.Scale,windowOrigin.X.Offset+offset.X,
+        windowOrigin.Y.Scale,windowOrigin.Y.Offset+offset.Y)
+    backdrop.Position=window.Position+UDim2.fromOffset(5,6)
+end)
+on(UIS.InputEnded,function(input)
+    if input.UserInputType==Enum.UserInputType.MouseButton1 or
+        input.UserInputType==Enum.UserInputType.Touch then dragging=false end
+end)
+
+-- Scale and center the complete workspace on small displays.
+local sizeScale=create("UIScale",{Scale=1},window)
+local shadowScale=create("UIScale",{Scale=1},backdrop)
+local function fitWindow()
+    local camera=workspace.CurrentCamera
+    if not camera then return end
+    local viewport=camera.ViewportSize
+    local scale=math.clamp(math.min(1,(viewport.X-32)/1050,(viewport.Y-32)/656)
+        *extra.uiScale,.45,1)
+    sizeScale.Scale=scale
+    shadowScale.Scale=scale
+    if not dragging then
+        window.Position=UDim2.new(.5,-525*scale,.5,-328*scale)
+        backdrop.Position=window.Position+UDim2.fromOffset(5,6)
+    end
+end
+fitWindow()
+on(workspace:GetPropertyChangedSignal("CurrentCamera"),fitWindow)
+if workspace.CurrentCamera then
+    on(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"),fitWindow)
+end
+on(RunService.Heartbeat,function(dt)
+    if not alive then return end
+    -- Only 4 times a second; also keeps the selected target info updated.
+    moveTimer=moveTimer+dt
+    if moveTimer>=.25 then
+        moveTimer=0
+        local tr=targetReady()
+        if tr and root and root.Parent then
+            local distance=math.floor((tr.Position-root.Position).Magnitude)
+            selectedDistance.Text=tostring(distance).." STUDS AWAY"
+        elseif selected then
+            selectedDistance.Text="TARGET UNAVAILABLE"
+        end
+    end
+end)
+
+-- Additional movement and ESP updates, all disconnected on unload.
+local visualElapsed=0
+on(RunService.Heartbeat,function(dt)
+    if not alive then return end
+    if flyActive then
+        if not (selfReady() and flyRoot==root and flyVelocity and flyGyro) then
+            setFly(false)
+        else
+            local camera=workspace.CurrentCamera
+            if camera then
+                local forward=camera.CFrame.LookVector
+                local right=camera.CFrame.RightVector
+                local move=Vector3.zero
+                if UIS:IsKeyDown(Enum.KeyCode.W) then move=move+forward end
+                if UIS:IsKeyDown(Enum.KeyCode.S) then move=move-forward end
+                if UIS:IsKeyDown(Enum.KeyCode.A) then move=move-right end
+                if UIS:IsKeyDown(Enum.KeyCode.D) then move=move+right end
+                if UIS:IsKeyDown(Enum.KeyCode.Space) then move=move+Vector3.yAxis end
+                local descending=UIS:IsKeyDown(Enum.KeyCode.LeftControl) or
+                    UIS:IsKeyDown(Enum.KeyCode.RightControl)
+                if descending then move=move-Vector3.yAxis end
+                if move.Magnitude>1 then move=move.Unit end
+                local boostKey=extra.flightBoostKey=="Alt"
+                    and Enum.KeyCode.LeftAlt or Enum.KeyCode.LeftShift
+                local boosted=UIS:IsKeyDown(boostKey)
+                local verticalMultiplier=(move.Y<0 and extra.flightDescendPercent
+                    or extra.flightVerticalPercent)/100
+                local targetVelocity=Vector3.new(move.X,
+                    move.Y*verticalMultiplier,move.Z)*flySpeed
+                    *(boosted and extra.flightBoost or 1)
+                local smooth=extra.flightSmoothing/100
+                local alpha=1-smooth^(math.max(dt,1/120)*60)
+                extra.flightCurrentVelocity=(extra.flightCurrentVelocity or Vector3.zero):Lerp(
+                    targetVelocity,math.clamp(alpha,0,1))
+                flyVelocity.Velocity=extra.flightCurrentVelocity
+                local flat=Vector3.new(forward.X,0,forward.Z)
+                if extra.flightFacing=="Travel Direction" then
+                    local travel=Vector3.new(move.X,0,move.Z)
+                    if travel.Magnitude>.05 then flat=travel end
+                end
+                if flat.Magnitude>.05 then
+                    flyGyro.CFrame=CFrame.lookAt(root.Position,root.Position+flat.Unit)
+                end
+            end
+        end
+    end
+    if noclipActive and char and char.Parent then
+        for _,part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") and
+                (extra.noclipAccessories=="Include" or
+                    not part:FindFirstAncestorOfClass("Accessory")) and
+                (noclipScope=="All Parts" or
+                    (part.Name~="HumanoidRootPart" and part.Name~="Head")) then
+                if noclipParts[part]==nil then
+                    noclipParts[part]=part.CanCollide
+                end
+                part.CanCollide=false
+            end
+        end
+    end
+    if hum and hum.Parent and hum.Health>0 then
+        if speedActive then
+            local sprintKey=extra.sprintKey=="Alt"
+                and Enum.KeyCode.LeftAlt or Enum.KeyCode.LeftShift
+            local sprinting=extra.sprintMode=="Always" or UIS:IsKeyDown(sprintKey)
+            hum.WalkSpeed=walkSpeedValue*(sprinting and extra.sprintMultiplier or 1)
+        end
+        if jumpActive then
+            if hum.UseJumpPower then hum.JumpPower=jumpPowerValue
+            else hum.JumpHeight=jumpHeightValue end
+        end
+    end
+    if hum and hum.Parent and hum.FloorMaterial~=Enum.Material.Air then
+        extra.airJumpCount=0
+    end
+    visualElapsed=visualElapsed+dt
+    if visualElapsed>=extra.espRefreshRate then
+        visualElapsed=0
+        updateVisuals()
+    end
+end)
+-- Camera aim assistance and UI FOV circle. This uses the game camera,
+-- not a server remote, and only provides input-side tracking.
+on(RunService.RenderStepped,function(dt)
+    if not alive then return end
+    local a=extra.aim
+    local camera=workspace.CurrentCamera
+    if not camera then
+        a.ring.Visible=false
+        a.partNow=nil
+        a.positionNow=nil
+        return
+    end
+    local center=a.centerPoint(camera)
+    local r=a.radius
+    a.ring.Visible=a.showFov
+    if a.showFov then
+        a.ring.Size=UDim2.fromOffset(r*2,r*2)
+        a.ring.Position=UDim2.fromOffset(center.X-r,center.Y-r)
+        a.ringStroke.Thickness=a.strokeWidth
+        a.ringStroke.Transparency=1-a.circleOpacity/100
+    end
+    if a.enabled or a.silent then
+        a.partNow,a.positionNow=a.findTarget(camera)
+    else
+        a.partNow=nil
+        a.positionNow=nil
+    end
+    if a.enabled and a.positionNow then
+        local activated=a.activation=="Always" or
+            UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+        if activated then
+            local targetCF=CFrame.lookAt(camera.CFrame.Position,a.positionNow)
+            local strength=math.clamp(a.smooth/100,.01,1)
+            local t=1-(1-strength)^(math.max(0,dt or 1/60)*60)
+            camera.CFrame=camera.CFrame:Lerp(targetCF,math.clamp(t,0,1))
+        end
+    end
+end)
+-- Update Box ESP after the camera updates, once per displayed frame.
+-- This is separate from the slower text/chams refresh timer.
+on(RunService.RenderStepped,function(dt)
+    if alive then extra.overlay.update(dt) end
+end)
+on(UIS.JumpRequest,function()
+    if infiniteJumpActive and not flyActive and hum and hum.Parent and hum.Health>0
+        and os.clock()-lastExtraJump>=jumpGap then
+        if extra.maxAirJumps~=0 and extra.airJumpCount>=extra.maxAirJumps then return end
+        lastExtraJump=os.clock()
+        extra.airJumpCount=extra.airJumpCount+1
+        pcall(function()
+            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+            if root and root.Parent then
+                local v=root.AssemblyLinearVelocity
+                root.AssemblyLinearVelocity=Vector3.new(v.X,
+                    math.max(v.Y,extra.airJumpVelocity),v.Z)
+            end
+        end)
+    end
+end)
+
+local function setupCharacter(nextCharacter)
+    version=version+1
+    local current=version
+    if flyActive then
+        flyActive=false
+        removeFlightObjects()
+    end
+    restoreNoclip()
+    char=nextCharacter
+    hum=nil
+    root=nil
+    contactToken=contactToken+1
+    if contactBusy then restoreContact() end
+    local h=nextCharacter:WaitForChild("Humanoid",10)
+    local r=nextCharacter:WaitForChild("HumanoidRootPart",10)
+    if not alive or current~=version then return end
+    hum=h
+    root=r
+    extra.airJumpCount=0
+    originalSpeed=h and h.WalkSpeed or nil
+    originalJumpPower=h and h.JumpPower or nil
+    originalJumpHeight=h and h.JumpHeight or nil
+    if refreshToggles then refreshToggles() end
+end
+on(me.CharacterAdded,function(newCharacter)
+    task.spawn(setupCharacter,newCharacter)
+end)
+if me.Character then task.spawn(setupCharacter,me.Character) end
+
+-- Fully reversible cleanup of this instance.
+unload=function()
+    if not alive then return end
+    contactToken=contactToken+1
+    if contactBusy then restoreContact() end
+    if flyActive then setFly(false) else removeFlightObjects() end
+    noclipActive=false
+    restoreNoclip()
+    speedActive=false
+    jumpActive=false
+    infiniteJumpActive=false
+    restoreMovement()
+    clearVisuals()
+    extra.clickTeleportEnabled=false
+    extra.aim.enabled=false
+    extra.aim.silent=false
+    extra.aim.showFov=false
+    if extra.aim.hookState then
+        extra.aim.hookState.active=false
+        extra.aim.hookState.getAim=function() return nil,nil end
+    end
+    extra.overlay.boxes=false
+    extra.overlay.destroy()
+    alive=false
+    version=version+1
+    for _,connection in ipairs(rosterConnections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(rosterConnections)
+    for _,connection in ipairs(connections) do
+        pcall(function() connection:Disconnect() end)
+    end
+    table.clear(connections)
+    if gui.Parent then gui:Destroy() end
+    if globalEnv.CreamysChaosLabUnload==unload then
+        globalEnv.CreamysChaosLabUnload=nil
+    end
+end
+globalEnv.CreamysChaosLabUnload=unload
+extra.edge.applyStyle()
+saveTheme()
+extra.saveUiStyle()
+message("ZAX READY","Universal Hub loaded")
+print("[ZAX Universal Hub] Loaded. RightShift toggles the UI.")
