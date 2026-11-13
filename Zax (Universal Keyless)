@@ -274,12 +274,14 @@ local backdrop=rounded(create("Frame",{
     BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=1,
     BorderSizePixel=0,
 },gui),21)
-local window=rounded(create("Frame",{
+-- CanvasGroup clips descendants to the rounded outline; an ordinary Frame
+-- with UICorner leaves the square sidebar visible at the outer corners.
+local window=rounded(create("CanvasGroup",{
     Name="NOXWindow",Size=UDim2.fromOffset(1050,656),
     Position=UDim2.new(.5,-530,.5,-330),
     BackgroundColor3=C.canvas,BackgroundTransparency=surfaceOpacity,BorderSizePixel=0,
     ClipsDescendants=true,Active=true,
-},gui),19)
+},gui),24)
 stroke(window,C.stroke,.40,1)
 
 -- Dedicated sidebar: never overlaid over page content.
