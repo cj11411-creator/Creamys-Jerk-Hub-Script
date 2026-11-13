@@ -171,6 +171,16 @@ function extra.edge.applyStyle()
     for obj,base in pairs(extra.edge.corners) do
         if obj.Parent then obj.CornerRadius=UDim.new(0,extra.edge.roundPixels(base)) end
     end
+    -- Keep the sidebar's outside corners matched to the outer window when
+    -- the Appearance > Corner Roundness slider changes.
+    local sidebar=extra.edge.sidebarCorners
+    if sidebar and sidebar.Parent then
+        local radius=UDim.new(0,extra.edge.roundPixels(24))
+        sidebar.TopLeftRadius=radius
+        sidebar.BottomLeftRadius=radius
+        sidebar.TopRightRadius=UDim.new(0,0)
+        sidebar.BottomRightRadius=UDim.new(0,0)
+    end
     for obj,base in pairs(extra.edge.strokes) do
         if obj.Parent then obj.Transparency=extra.edge.softenedAlpha(base) end
     end
@@ -274,9 +284,9 @@ local backdrop=rounded(create("Frame",{
     BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=1,
     BorderSizePixel=0,
 },gui),21)
--- CanvasGroup clips descendants to the rounded outline; an ordinary Frame
--- with UICorner leaves the square sidebar visible at the outer corners.
-local window=rounded(create("CanvasGroup",{
+-- Outer window has rounded edges.  Each full-height color layer must
+-- also shape its own corners instead of relying on parent clipping.
+local window=rounded(create("Frame",{
     Name="NOXWindow",Size=UDim2.fromOffset(1050,656),
     Position=UDim2.new(.5,-530,.5,-330),
     BackgroundColor3=C.canvas,BackgroundTransparency=surfaceOpacity,BorderSizePixel=0,
@@ -289,6 +299,15 @@ local left=create("Frame",{
     Size=UDim2.fromOffset(194,656),BackgroundColor3=C.rail,
     BackgroundTransparency=surfaceOpacity*.78,BorderSizePixel=0,
 },window)
+-- This full-height sidebar previously painted a sharp rectangular block over
+-- the outer window.  Round ONLY its two outside corners; the right side stays
+-- flush against the content area.
+extra.edge.sidebarCorners=create("UICorner",{
+    TopLeftRadius=UDim.new(0,extra.edge.roundPixels(24)),
+    BottomLeftRadius=UDim.new(0,extra.edge.roundPixels(24)),
+    TopRightRadius=UDim.new(0,0),
+    BottomRightRadius=UDim.new(0,0),
+},left)
 create("Frame",{Position=UDim2.fromOffset(193,0),
     Size=UDim2.new(0,1,1,0),BackgroundColor3=C.stroke,
     BackgroundTransparency=.54,BorderSizePixel=0},left)
