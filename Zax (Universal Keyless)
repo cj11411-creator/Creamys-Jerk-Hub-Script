@@ -269,7 +269,7 @@ local gui=create("ScreenGui",{
 },playerGui)
 
 local backdrop=rounded(create("Frame",{
-    Name="Shadow",Size=UDim2.fromOffset(1060,667),
+    Name="Shadow",Visible=false,Size=UDim2.fromOffset(1060,667),
     Position=UDim2.new(.5,-525,.5,-324),
     BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=.52,
     BorderSizePixel=0,
