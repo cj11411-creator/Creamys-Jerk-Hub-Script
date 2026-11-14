@@ -1,5 +1,5 @@
 --[[
-    ZAX UNIVERSAL HUB / MAIN AIM v3
+    ZAX UNIVERSAL HUB / STUDIO v4 - PERSISTENT CONFIG
     Redesigned workspace UI; original gameplay feature callbacks retained.
     Single-file LocalScript for Roblox R6/R15.
     Use in games that permit this sort of play.
@@ -24,6 +24,93 @@ if type(globalEnv.CreamysChaosLabUnload) == "function" then
     pcall(globalEnv.CreamysChaosLabUnload)
 end
 
+-- ZAX persistent configuration (single JSON file per executor environment).
+-- Normal Roblox LocalScripts cannot read/write local files. Missing file APIs
+-- are handled safely and leave the normal hub functionality unchanged.
+globalEnv.ZAXConfigRuntime = {
+    path="ZAX_Universal_Hub_Config.json",
+    supported=type(readfile)=="function" and type(writefile)=="function",
+    settings={}, toggles={}, defaults={}, toggleDefaults={},
+    muted=true, serial=0, autosave=true, restoredOnce=false,
+    loaded={}, note="",
+}
+function globalEnv.ZAXConfigRuntime.read()
+    if not globalEnv.ZAXConfigRuntime.supported then return nil,"Local file storage unavailable" end
+    local ok,raw=pcall(readfile,globalEnv.ZAXConfigRuntime.path)
+    if not ok or type(raw)~="string" then return nil,"No saved config yet" end
+    local valid,data=pcall(function() return game:GetService("HttpService"):JSONDecode(raw) end)
+    if not valid or type(data)~="table" or data.version~=1 then
+        return nil,"Saved config is invalid or outdated"
+    end
+    return data,"Loaded from file"
+end
+globalEnv.ZAXConfigRuntime.loaded,globalEnv.ZAXConfigRuntime.note=globalEnv.ZAXConfigRuntime.read()
+if type(globalEnv.ZAXConfigRuntime.loaded)~="table" then globalEnv.ZAXConfigRuntime.loaded={} end
+if type(globalEnv.ZAXConfigRuntime.loaded.settings)~="table" then globalEnv.ZAXConfigRuntime.loaded.settings={} end
+if type(globalEnv.ZAXConfigRuntime.loaded.toggles)~="table" then globalEnv.ZAXConfigRuntime.loaded.toggles={} end
+globalEnv.ZAXConfigRuntime.autosave=globalEnv.ZAXConfigRuntime.loaded.autosave~=false
+-- Restore the two existing session-only preference objects BEFORE the UI
+-- reads them, so theme/rounded edges also survive a fresh Roblox session.
+if type(globalEnv.ZAXConfigRuntime.loaded.theme)=="table" then
+    globalEnv.CreamysChaosLabThemeGraphite=globalEnv.ZAXConfigRuntime.loaded.theme
+end
+if type(globalEnv.ZAXConfigRuntime.loaded.style)=="table" then
+    globalEnv.ZAXUiStyle=globalEnv.ZAXConfigRuntime.loaded.style
+end
+function globalEnv.ZAXConfigRuntime.validSetting(record,value)
+    local spec=record.spec
+    if type(spec)=="table" and spec.type=="slider" then
+        if type(value)~="number" or value~=value or
+            value==math.huge or value==-math.huge then return nil end
+        return math.clamp(value,spec.min,spec.max)
+    end
+    if type(spec)=="table" then
+        for _,choice in ipairs(spec) do
+            local allowed=type(choice)=="table" and choice.value or choice
+            if allowed==value then return value end
+        end
+    end
+    return nil
+end
+function globalEnv.ZAXConfigRuntime.applySetting(record,value)
+    local valid=globalEnv.ZAXConfigRuntime.validSetting(record,value)
+    if valid==nil then return end
+    local ok,err=pcall(record.set,valid)
+    if not ok then warn("[ZAX Config] Setting restore failed:",err) end
+end
+function globalEnv.ZAXConfigRuntime.registerSetting(title,label,spec,get,set)
+    local key=title.." / "..label
+    local record={spec=spec,get=get,set=set}
+    globalEnv.ZAXConfigRuntime.settings[key]=record
+    if globalEnv.ZAXConfigRuntime.defaults[key]==nil then globalEnv.ZAXConfigRuntime.defaults[key]=get() end
+    local value=globalEnv.ZAXConfigRuntime.loaded.settings[key]
+    if value~=nil then globalEnv.ZAXConfigRuntime.applySetting(record,value) end
+end
+function globalEnv.ZAXConfigRuntime.registerToggle(title,get,set)
+    globalEnv.ZAXConfigRuntime.toggles[title]={get=get,set=set}
+    globalEnv.ZAXConfigRuntime.toggleDefaults[title]=get()
+end
+function globalEnv.ZAXConfigRuntime.write()
+    if not globalEnv.ZAXConfigRuntime.supported then return false,"This environment has no readfile/writefile support" end
+    if not globalEnv.ZAXConfigRuntime.snapshot then return false,"Config not initialized yet" end
+    local ok,reason=pcall(function()
+        writefile(globalEnv.ZAXConfigRuntime.path,game:GetService("HttpService"):JSONEncode(globalEnv.ZAXConfigRuntime.snapshot()))
+    end)
+    return ok,ok and "Saved to "..globalEnv.ZAXConfigRuntime.path or tostring(reason)
+end
+function globalEnv.ZAXConfigRuntime.changed()
+    if globalEnv.ZAXConfigRuntime.muted or not globalEnv.ZAXConfigRuntime.autosave or not globalEnv.ZAXConfigRuntime.supported then return end
+    globalEnv.ZAXConfigRuntime.serial=globalEnv.ZAXConfigRuntime.serial+1
+    local request=globalEnv.ZAXConfigRuntime.serial
+    -- Debounce fast slider dragging so writefile is not called every frame.
+    task.delay(.9,function()
+        if request==globalEnv.ZAXConfigRuntime.serial and not globalEnv.ZAXConfigRuntime.muted then
+            local ok,reason=globalEnv.ZAXConfigRuntime.write()
+            if not ok then warn("[ZAX Config] Autosave:",reason) end
+        end
+    end)
+end
+
 -- Runtime state
 -- Group optional settings into one table to avoid Roblox/Luau local limits.
 local extra = {
@@ -46,7 +133,7 @@ local extra = {
     sprintMode = "Hold", chamsRange = 0, nameRange = 0,
     espThroughWalls = "On", espStrokeTransparency = .3,
     -- UI polishing
-    cornerRoundness = 1.35, borderSoftness = 25,
+    cornerRoundness = 1.50, borderSoftness = 25,
     toastDuration = 2.5, uiMotion = "On",
     -- Box ESP uses per-frame projection and cached bounds; no Tracers feature.
     overlay = {
@@ -73,6 +160,9 @@ end
 local alive = true
 local shown = true
 local toggleKey = Enum.KeyCode.RightShift
+if type(globalEnv.ZAXConfigRuntime.loaded.keybind)=="string" and Enum.KeyCode[globalEnv.ZAXConfigRuntime.loaded.keybind] then
+    toggleKey=Enum.KeyCode[globalEnv.ZAXConfigRuntime.loaded.keybind]
+end
 local rebinding = false
 local selected = nil
 local searchText = ""
@@ -147,7 +237,8 @@ local function create(class, props, parent)
     return obj
 end
 -- Track GUI edges so roundness/softness can update every panel live.
-extra.edge={corners=setmetatable({}, {__mode="k"}),strokes=setmetatable({}, {__mode="k"})}
+extra.edge={corners=setmetatable({}, {__mode="k"}),
+    leftCorners=setmetatable({}, {__mode="k"}),strokes=setmetatable({}, {__mode="k"})}
 function extra.edge.roundPixels(base)
     return math.max(2, math.floor(base*extra.cornerRoundness+.5))
 end
@@ -158,6 +249,17 @@ local function rounded(obj, r)
     local original=r or 11
     local corner=create("UICorner", {CornerRadius=UDim.new(0,extra.edge.roundPixels(original))},obj)
     extra.edge.corners[corner]=original
+    return obj
+end
+-- Only the outside-left corners of the sidebar should round; the
+-- interior edge remains straight and aligned with the workspace.
+function extra.edge.roundedLeft(obj, base)
+    -- CanvasGroup clips to an actual UICorner; UICorner has one CornerRadius
+    -- property (not individual per-corner radii).
+    local corner=create("UICorner",{
+        CornerRadius=UDim.new(0,extra.edge.roundPixels(base))
+    },obj)
+    extra.edge.leftCorners[corner]=base
     return obj
 end
 local function stroke(obj, c, alpha, thick)
@@ -171,15 +273,10 @@ function extra.edge.applyStyle()
     for obj,base in pairs(extra.edge.corners) do
         if obj.Parent then obj.CornerRadius=UDim.new(0,extra.edge.roundPixels(base)) end
     end
-    -- Keep the sidebar's outside corners matched to the outer window when
-    -- the Appearance > Corner Roundness slider changes.
-    local sidebar=extra.edge.sidebarCorners
-    if sidebar and sidebar.Parent then
-        local radius=UDim.new(0,extra.edge.roundPixels(24))
-        sidebar.TopLeftRadius=radius
-        sidebar.BottomLeftRadius=radius
-        sidebar.TopRightRadius=UDim.new(0,0)
-        sidebar.BottomRightRadius=UDim.new(0,0)
+    for obj,base in pairs(extra.edge.leftCorners) do
+        if obj.Parent then
+            obj.CornerRadius=UDim.new(0,extra.edge.roundPixels(base))
+        end
     end
     for obj,base in pairs(extra.edge.strokes) do
         if obj.Parent then obj.Transparency=extra.edge.softenedAlpha(base) end
@@ -269,8 +366,8 @@ local function colorHex(color)
         math.floor(color.B*255+.5))
 end
 
--- A restrained 3-column workspace. The gameplay callbacks below are unchanged.
--- Build GUI before waiting for character parts so it can always initialize.
+-- ZAX STUDIO / clean two-column architecture, no shadows.
+-- Core tool callbacks and all configuration keys remain unchanged.
 local previousGui=playerGui:FindFirstChild("CreamysChaosLab")
 if previousGui then previousGui:Destroy() end
 local gui=create("ScreenGui",{
@@ -278,144 +375,137 @@ local gui=create("ScreenGui",{
     IgnoreGuiInset=true,ZIndexBehavior=Enum.ZIndexBehavior.Sibling,
 },playerGui)
 
-local backdrop=rounded(create("Frame",{
-    Name="Shadow",Visible=false,Size=UDim2.fromOffset(1060,667),
-    Position=UDim2.new(.5,-525,.5,-324),
-    BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=1,
-    BorderSizePixel=0,
-},gui),21)
--- Outer window has rounded edges.  Each full-height color layer must
--- also shape its own corners instead of relying on parent clipping.
+-- Invisible compatibility anchor for existing hide/scale logic; never displayed.
+local backdrop=create("Frame",{
+    Name="ShadowlessLayoutAnchor",Size=UDim2.fromOffset(1050,656),
+    Position=UDim2.new(.5,-525,.5,-328),BackgroundTransparency=1,
+    BorderSizePixel=0,Visible=false,
+},gui)
 local window=rounded(create("Frame",{
     Name="NOXWindow",Size=UDim2.fromOffset(1050,656),
-    Position=UDim2.new(.5,-530,.5,-330),
-    BackgroundColor3=C.canvas,BackgroundTransparency=surfaceOpacity,BorderSizePixel=0,
-    ClipsDescendants=true,Active=true,
-},gui),24)
-stroke(window,C.stroke,.40,1)
+    Position=UDim2.new(.5,-525,.5,-328),
+    BackgroundColor3=C.canvas,BackgroundTransparency=surfaceOpacity,
+    BorderSizePixel=0,ClipsDescendants=true,Active=true,
+},gui),25)
+stroke(window,C.stroke,.70,1)
 
--- Dedicated sidebar: never overlaid over page content.
-local left=create("Frame",{
-    Size=UDim2.fromOffset(194,656),BackgroundColor3=C.rail,
-    BackgroundTransparency=surfaceOpacity*.78,BorderSizePixel=0,
-},window)
--- This full-height sidebar previously painted a sharp rectangular block over
--- the outer window.  Round ONLY its two outside corners; the right side stays
--- flush against the content area.
-extra.edge.sidebarCorners=create("UICorner",{
-    TopLeftRadius=UDim.new(0,extra.edge.roundPixels(24)),
-    BottomLeftRadius=UDim.new(0,extra.edge.roundPixels(24)),
-    TopRightRadius=UDim.new(0,0),
-    BottomRightRadius=UDim.new(0,0),
-},left)
-create("Frame",{Position=UDim2.fromOffset(193,0),
-    Size=UDim2.new(0,1,1,0),BackgroundColor3=C.stroke,
-    BackgroundTransparency=.54,BorderSizePixel=0},left)
+-- The single rounded CanvasGroup clips the left edge correctly.
+local left=extra.edge.roundedLeft(create("CanvasGroup",{
+    Size=UDim2.fromOffset(204,656),
+    BackgroundColor3=C.rail,BackgroundTransparency=surfaceOpacity*.78,
+    BorderSizePixel=0,ClipsDescendants=true,
+},window),25)
+-- No overlay patch: avoid a darker vertical strip from layered transparency.
+create("Frame",{Position=UDim2.fromOffset(203,0),Size=UDim2.fromOffset(1,656),
+    BackgroundColor3=C.stroke,BackgroundTransparency=.83,BorderSizePixel=0},left)
+
 local brandMark=rounded(create("Frame",{
-    Position=UDim2.fromOffset(18,23),Size=UDim2.fromOffset(38,38),
+    Position=UDim2.fromOffset(19,22),Size=UDim2.fromOffset(43,43),
     BackgroundColor3=C.mint,BorderSizePixel=0,
-},left),12)
+},left),13)
 create("TextLabel",{Size=UDim2.fromScale(1,1),Text="Z",
-    TextColor3=C.canvas,Font=Enum.Font.GothamBlack,TextSize=23,
+    TextColor3=C.canvas,Font=Enum.Font.GothamBlack,TextSize=27,
     BackgroundTransparency=1},brandMark)
-create("TextLabel",{Position=UDim2.fromOffset(67,20),Size=UDim2.fromOffset(109,24),
-    Text="ZAX",Font=Enum.Font.GothamBold,TextSize=19,
+create("TextLabel",{Position=UDim2.fromOffset(75,19),Size=UDim2.fromOffset(102,29),
+    Text="ZAX",Font=Enum.Font.GothamBold,TextSize=24,
     TextColor3=C.text,TextXAlignment=Enum.TextXAlignment.Left,
     BackgroundTransparency=1},left)
-create("TextLabel",{Position=UDim2.fromOffset(67,44),Size=UDim2.fromOffset(112,17),
-    Text="UNIVERSAL HUB",Font=Enum.Font.GothamMedium,TextSize=10,
+create("TextLabel",{Position=UDim2.fromOffset(76,48),Size=UDim2.fromOffset(119,15),
+    Text="UNIVERSAL HUB",Font=Enum.Font.GothamMedium,TextSize=9,
     TextColor3=C.dim,TextXAlignment=Enum.TextXAlignment.Left,
     BackgroundTransparency=1},left)
-create("Frame",{Position=UDim2.fromOffset(19,87),
-    Size=UDim2.fromOffset(155,1),BackgroundColor3=C.stroke,
-    BackgroundTransparency=.6,BorderSizePixel=0},left)
-create("TextLabel",{Position=UDim2.fromOffset(20,108),Size=UDim2.fromOffset(150,22),
-    Text="WORKSPACE",Font=Enum.Font.GothamBold,TextSize=10,
-    TextColor3=C.dim,BackgroundTransparency=1,
-    TextXAlignment=Enum.TextXAlignment.Left},left)
+create("Frame",{Position=UDim2.fromOffset(18,86),Size=UDim2.fromOffset(167,1),
+    BackgroundColor3=C.stroke,BackgroundTransparency=.83,BorderSizePixel=0},left)
+create("TextLabel",{Position=UDim2.fromOffset(20,103),Size=UDim2.fromOffset(160,19),
+    Text="NAVIGATION",Font=Enum.Font.GothamBold,TextSize=9,
+    TextColor3=C.dim,TextXAlignment=Enum.TextXAlignment.Left,
+    BackgroundTransparency=1},left)
 
 local navList={"MAIN","MOVEMENT","VISUALS","THEMES","SETTINGS"}
 local navButtons={}
 local activePage="MAIN"
 local pageNames={
-    MAIN={"Aim","Aimbot, legacy silent aim and FOV controls."},
-    MOVEMENT={"Movement","Tune how your character moves."},
-    VISUALS={"Player visuals","Player highlighting and information."},
-    THEMES={"Appearance","Customize the entire workspace."},
-    SETTINGS={"Preferences","Session controls and configuration."},
+    MAIN={"Aim","Precision tools and on-screen FOV settings."},
+    MOVEMENT={"Movement","Character movement, flight and mobility."},
+    VISUALS={"Visuals","Player highlighting and tracking options."},
+    THEMES={"Appearance","Presets, color and transparent surfaces."},
+    SETTINGS={"Settings","Preferences, keybinds and saved configs."},
 }
 
--- Workspace header: one clear title, one secondary line, no nested cards.
+-- Modern header: title, concise subtitle and a right-aligned theme chip.
 local mainHeader=create("Frame",{
-    Position=UDim2.fromOffset(218,18),Size=UDim2.fromOffset(551,91),
+    Position=UDim2.fromOffset(229,18),Size=UDim2.fromOffset(794,97),
     BackgroundTransparency=1,Active=true,
 },window)
+rounded(create("Frame",{
+    Position=UDim2.fromOffset(1,8),Size=UDim2.fromOffset(7,7),
+    BackgroundColor3=C.mint,BorderSizePixel=0,
+},mainHeader),4)
 local eyebrow=create("TextLabel",{
-    Position=UDim2.fromOffset(0,0),Size=UDim2.fromOffset(300,18),
-    Text="ZAX UNIVERSAL HUB  /  WORKSPACE",TextColor3=C.mint,
+    Position=UDim2.fromOffset(15,0),Size=UDim2.fromOffset(460,23),
+    Text="ZAX  /  UNIVERSAL WORKSPACE",TextColor3=C.dim,
     Font=Enum.Font.GothamBold,TextSize=10,
     TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
 },mainHeader)
 local pageTitle=create("TextLabel",{
-    Position=UDim2.fromOffset(0,21),Size=UDim2.fromOffset(426,36),
-    Text="Aim assistance",TextColor3=C.text,
-    Font=Enum.Font.GothamBold,TextSize=26,
+    Position=UDim2.fromOffset(0,24),Size=UDim2.fromOffset(485,39),
+    Text="Aim",TextColor3=C.text,
+    Font=Enum.Font.GothamBold,TextSize=30,
     TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
 },mainHeader)
 local pageSub=create("TextLabel",{
-    Position=UDim2.fromOffset(0,59),Size=UDim2.fromOffset(490,21),
-    Text="Tune your aim and on-screen target selection.",TextColor3=C.dim,
+    Position=UDim2.fromOffset(0,67),Size=UDim2.fromOffset(545,22),
+    Text="Precision tools and on-screen FOV settings.",TextColor3=C.dim,
     Font=Enum.Font.Gotham,TextSize=12,
     TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
 },mainHeader)
 local themeChip=rounded(create("TextLabel",{
-    Position=UDim2.fromOffset(528,31),Size=UDim2.fromOffset(172,27),
-    Text="THEME  /  "..string.upper(paletteName),
-    TextColor3=C.dim,BackgroundColor3=C.panel,
+    Position=UDim2.fromOffset(808,44),Size=UDim2.fromOffset(163,32),
+    Text=""..string.upper(paletteName).."  THEME",
+    TextColor3=C.mint,BackgroundColor3=C.badge,
     Font=Enum.Font.GothamBold,TextSize=10,BorderSizePixel=0,
-},window),9)
+},window),12)
+stroke(themeChip,C.stroke,.85)
 local close=rounded(create("TextButton",{
-    Position=UDim2.fromOffset(728,30),Size=UDim2.fromOffset(37,30),
-    Text="X",Font=Enum.Font.GothamBold,TextSize=12,
+    Position=UDim2.fromOffset(986,44),Size=UDim2.fromOffset(40,32),
+    Text="X",Font=Enum.Font.GothamBold,TextSize=13,
     TextColor3=C.dim,BackgroundColor3=C.panel,BorderSizePixel=0,
     AutoButtonColor=false,
-},window),9)
-stroke(close,C.stroke,.7)
-create("Frame",{Position=UDim2.fromOffset(217,113),
-    Size=UDim2.fromOffset(549,1),BackgroundColor3=C.stroke,
-    BackgroundTransparency=.54,BorderSizePixel=0},window)
+},window),12)
+stroke(close,C.stroke,.82)
+create("Frame",{Position=UDim2.fromOffset(229,119),Size=UDim2.fromOffset(796,1),
+    BackgroundColor3=C.stroke,BackgroundTransparency=.82,BorderSizePixel=0},window)
 
--- Lower sidebar controls have their own separated region.
-create("Frame",{Position=UDim2.fromOffset(18,489),
-    Size=UDim2.fromOffset(158,1),BackgroundColor3=C.stroke,
-    BackgroundTransparency=.55,BorderSizePixel=0},left)
-create("TextLabel",{Position=UDim2.fromOffset(20,500),Size=UDim2.fromOffset(148,19),
-    Text="QUICK ACCESS",TextColor3=C.dim,Font=Enum.Font.GothamBold,
+-- Subdued quick controls and keybinds, anchored away from navigation.
+create("Frame",{Position=UDim2.fromOffset(19,475),Size=UDim2.fromOffset(165,1),
+    BackgroundColor3=C.stroke,BackgroundTransparency=.82,BorderSizePixel=0},left)
+create("TextLabel",{Position=UDim2.fromOffset(20,488),Size=UDim2.fromOffset(155,20),
+    Text="QUICK CONTROLS",TextColor3=C.dim,Font=Enum.Font.GothamBold,
     TextSize=9,TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1},left)
 local keyButton=rounded(create("TextButton",{
-    Position=UDim2.fromOffset(18,527),Size=UDim2.fromOffset(158,34),
-    Text="KEY: RIGHTSHIFT",TextColor3=C.text,
+    Position=UDim2.fromOffset(17,518),Size=UDim2.fromOffset(168,38),
+    Text="KEY: "..string.upper(toggleKey.Name),TextColor3=C.text,
     Font=Enum.Font.GothamBold,TextSize=10,
     BackgroundColor3=C.card,BorderSizePixel=0,
-},left),10)
-stroke(keyButton,C.stroke,.69)
+},left),12)
+stroke(keyButton,C.stroke,.85)
 local restore=rounded(create("TextButton",{
-    Position=UDim2.fromOffset(18,571),Size=UDim2.fromOffset(158,34),
+    Position=UDim2.fromOffset(17,566),Size=UDim2.fromOffset(168,38),
     Text="RESET MOVEMENT",TextColor3=C.dim,
     BackgroundColor3=C.card,Font=Enum.Font.GothamBold,
     TextSize=10,BorderSizePixel=0,
-},left),10)
-stroke(restore,C.stroke,.69)
-create("TextLabel",{Position=UDim2.fromOffset(20,615),Size=UDim2.fromOffset(154,20),
-    Text="ZAX  /  UNIVERSAL HUB",TextColor3=C.dim,
+},left),12)
+stroke(restore,C.stroke,.85)
+create("TextLabel",{Position=UDim2.fromOffset(20,625),Size=UDim2.fromOffset(165,16),
+    Text="STUDIO UI  /  V4",TextColor3=C.dim,
     BackgroundTransparency=1,Font=Enum.Font.GothamMedium,
     TextSize=9,TextXAlignment=Enum.TextXAlignment.Left},left)
 
 -- Legacy player directory retained internally but hidden: Main uses an aim reference panel.
 local sidePanel=rounded(create("Frame",{
-    Position=UDim2.fromOffset(789,17),Size=UDim2.fromOffset(242,619),
-    BackgroundColor3=C.panel,BackgroundTransparency=surfaceOpacity*.65,BorderSizePixel=0,
-},window),16)
+    Position=UDim2.fromOffset(1070,17),Size=UDim2.fromOffset(242,619),
+    BackgroundColor3=C.panel,BackgroundTransparency=surfaceOpacity*.65,BorderSizePixel=0,Visible=false,
+},window),18)
 stroke(sidePanel,C.stroke,.67)
 create("TextLabel",{Position=UDim2.fromOffset(16,15),Size=UDim2.fromOffset(206,22),
     Text="Player directory",Font=Enum.Font.GothamBold,TextSize=14,
@@ -504,9 +594,9 @@ create("TextLabel",{
 local contextPanel,contextMark,contextTitle,contextBody,contextContents
 do
 contextPanel=rounded(create("Frame",{
-    Position=UDim2.fromOffset(789,17),Size=UDim2.fromOffset(242,619),
+    Position=UDim2.fromOffset(1070,17),Size=UDim2.fromOffset(242,619),
     BackgroundColor3=C.panel,BackgroundTransparency=surfaceOpacity*.65,BorderSizePixel=0,Visible=false,
-},window),16)
+},window),18)
 stroke(contextPanel,C.stroke,.68)
 local contextTop=rounded(create("Frame",{
     Position=UDim2.fromOffset(16,18),Size=UDim2.fromOffset(210,95),
@@ -567,7 +657,7 @@ end
 local pages={}
 for _,name in ipairs(navList) do
     local holder=create("ScrollingFrame",{
-        Position=UDim2.fromOffset(217,130),Size=UDim2.fromOffset(554,450),
+        Position=UDim2.fromOffset(229,142),Size=UDim2.fromOffset(797,436),
         BackgroundTransparency=1,BorderSizePixel=0,
         Visible=name==activePage,CanvasSize=UDim2.fromOffset(0,0),
         AutomaticCanvasSize=Enum.AutomaticSize.Y,
@@ -583,7 +673,7 @@ for _,name in ipairs(navList) do
 end
 
 local statusPill=rounded(create("Frame",{
-    Position=UDim2.fromOffset(216,594),Size=UDim2.fromOffset(552,43),
+    Position=UDim2.fromOffset(229,594),Size=UDim2.fromOffset(797,41),
     BackgroundColor3=C.panel,BorderSizePixel=0,
 },window),11)
 stroke(statusPill,C.stroke,.70)
@@ -592,7 +682,7 @@ local statusDot=rounded(create("Frame",{
     BackgroundColor3=C.mint,BorderSizePixel=0,
 },statusPill),5)
 local status=create("TextLabel",{
-    Position=UDim2.fromOffset(34,10),Size=UDim2.fromOffset(502,23),
+    Position=UDim2.fromOffset(36,10),Size=UDim2.fromOffset(742,23),
     Text="READY  /  Choose a feature or open its settings",TextColor3=C.dim,
     Font=Enum.Font.GothamMedium,TextSize=11,
     TextXAlignment=Enum.TextXAlignment.Left,
@@ -970,14 +1060,14 @@ local featureCards={}
 local function section(tab,title,detail)
     cardIndex[tab]=cardIndex[tab]+1
     local wrap=create("Frame",{
-        LayoutOrder=cardIndex[tab],Size=UDim2.fromOffset(543,55),
+        LayoutOrder=cardIndex[tab],Size=UDim2.fromOffset(777,61),
         BackgroundTransparency=1,
     },pages[tab])
-    create("TextLabel",{Position=UDim2.fromOffset(3,6),Size=UDim2.fromOffset(532,21),
+    create("TextLabel",{Position=UDim2.fromOffset(3,6),Size=UDim2.fromOffset(735,23),
         BackgroundTransparency=1,Text=title,Font=Enum.Font.GothamBold,
-        TextSize=12,TextColor3=C.text,TextXAlignment=Enum.TextXAlignment.Left,
+        TextSize=14,TextColor3=C.text,TextXAlignment=Enum.TextXAlignment.Left,
     },wrap)
-    create("TextLabel",{Position=UDim2.fromOffset(3,28),Size=UDim2.fromOffset(532,18),
+    create("TextLabel",{Position=UDim2.fromOffset(3,28),Size=UDim2.fromOffset(735,19),
         BackgroundTransparency=1,Text=detail,Font=Enum.Font.Gotham,
         TextSize=11,TextColor3=C.dim,TextXAlignment=Enum.TextXAlignment.Left,
     },wrap)
@@ -985,39 +1075,39 @@ end
 local function action(tab,glyph,title,description,color,callback)
     cardIndex[tab]=cardIndex[tab]+1
     local card=rounded(create("Frame",{
-        LayoutOrder=cardIndex[tab],Size=UDim2.fromOffset(543,82),
-        BackgroundColor3=C.card,BackgroundTransparency=surfaceOpacity*.48,
+        LayoutOrder=cardIndex[tab],Size=UDim2.fromOffset(777,88),
+        BackgroundColor3=C.panel,BackgroundTransparency=surfaceOpacity*.37,
         BorderSizePixel=0,ClipsDescendants=true,
-    },pages[tab]),13)
-    local outline=stroke(card,C.stroke,.72)
+    },pages[tab]),18)
+    local outline=stroke(card,C.stroke,.81)
     local logo=rounded(create("Frame",{
-        Position=UDim2.fromOffset(15,20),Size=UDim2.fromOffset(42,42),
-        BackgroundColor3=C.rail,BorderSizePixel=0,
-    },card),11)
+        Position=UDim2.fromOffset(18,22),Size=UDim2.fromOffset(44,44),
+        BackgroundColor3=C.badge,BorderSizePixel=0,
+    },card),13)
     local logoStroke=stroke(logo,color,.80)
     create("TextLabel",{Size=UDim2.fromScale(1,1),Text=glyph,
         BackgroundTransparency=1,Font=Enum.Font.GothamBold,TextSize=11,
         TextColor3=color},logo)
-    create("TextLabel",{Position=UDim2.fromOffset(71,14),
-        Size=UDim2.fromOffset(307,23),Text=title,
+    create("TextLabel",{Position=UDim2.fromOffset(78,17),
+        Size=UDim2.fromOffset(475,23),Text=title,
         Font=Enum.Font.GothamBold,TextSize=14,TextColor3=C.text,
         BackgroundTransparency=1,TextXAlignment=Enum.TextXAlignment.Left},card)
-    create("TextLabel",{Position=UDim2.fromOffset(71,38),
-        Size=UDim2.fromOffset(307,30),Text=description,
+    create("TextLabel",{Position=UDim2.fromOffset(78,42),
+        Size=UDim2.fromOffset(465,28),Text=description,
         Font=Enum.Font.Gotham,TextSize=11,TextWrapped=true,
         TextColor3=C.dim,BackgroundTransparency=1,
         TextXAlignment=Enum.TextXAlignment.Left},card)
     local primary=rounded(create("TextButton",{
-        Position=UDim2.fromOffset(396,23),Size=UDim2.fromOffset(90,35),
+        Position=UDim2.fromOffset(617,24),Size=UDim2.fromOffset(100,39),
         Text="RUN",Font=Enum.Font.GothamBold,TextSize=11,
         TextColor3=C.canvas,BackgroundColor3=C.mint,
         BorderSizePixel=0,AutoButtonColor=false,
-    },card),10)
+    },card),13)
     local expand=rounded(create("TextButton",{
-        Position=UDim2.fromOffset(494,23),Size=UDim2.fromOffset(36,35),
-        Text="",BackgroundColor3=C.rail,
+        Position=UDim2.fromOffset(727,24),Size=UDim2.fromOffset(37,39),
+        Text="",BackgroundColor3=C.card,
         BorderSizePixel=0,AutoButtonColor=false,
-    },card),10)
+    },card),13)
     stroke(expand,C.stroke,.60)
     -- Draw arrows with 2 rotated Frames: never render as missing glyph boxes.
     local function chevron(parent,x,y)
@@ -1040,7 +1130,7 @@ local function action(tab,glyph,title,description,color,callback)
     end
     local setExpandArrow=chevron(expand,11,11)
     local divider=create("Frame",{
-        Position=UDim2.fromOffset(17,83),Size=UDim2.fromOffset(508,1),
+        Position=UDim2.fromOffset(20,89),Size=UDim2.fromOffset(737,1),
         BackgroundColor3=C.stroke,BackgroundTransparency=.64,
         BorderSizePixel=0,Visible=false,
     },card)
@@ -1053,31 +1143,38 @@ local function action(tab,glyph,title,description,color,callback)
         if not expanded then
             for _,r in ipairs(rows) do r.container.Visible=false end
             divider.Visible=false
-            card.Size=UDim2.fromOffset(543,82)
+            card.Size=UDim2.fromOffset(777,88)
             setExpandArrow(false)
             return
         end
         setExpandArrow(true)
         divider.Visible=true
-        local y=96
+        local y=102
         for _,r in ipairs(rows) do
-            r.container.Position=UDim2.fromOffset(18,y)
+            r.container.Position=UDim2.fromOffset(20,y)
             r.container.Visible=true
             r.refresh()
             y=y+r.height+8
         end
         -- UIListLayout on the page makes the next card follow this card's size.
-        card.Size=UDim2.fromOffset(543,y+6)
+        card.Size=UDim2.fromOffset(777,y+9)
     end
     local function addSetting(label,spec,get,set)
+        -- Restore a saved value before building its slider/choice UI.
+        local originalSet=set
+        set=function(value)
+            originalSet(value)
+            globalEnv.ZAXConfigRuntime.changed()
+        end
+        globalEnv.ZAXConfigRuntime.registerSetting(title,label,spec,get,set)
         local isSlider=type(spec)=="table" and spec.type=="slider"
         local row={height=isSlider and 82 or 79}
         row.container=create("Frame",{
-            Size=UDim2.fromOffset(507,row.height),Visible=false,
+            Size=UDim2.fromOffset(736,row.height),Visible=false,
             BackgroundTransparency=1,BorderSizePixel=0,
         },card)
         create("TextLabel",{
-            Position=UDim2.fromOffset(1,1),Size=UDim2.fromOffset(336,24),
+            Position=UDim2.fromOffset(1,1),Size=UDim2.fromOffset(505,24),
             BackgroundTransparency=1,Text=label:upper(),
             Font=Enum.Font.GothamBold,TextSize=10,TextColor3=C.dim,
             TextXAlignment=Enum.TextXAlignment.Left,
@@ -1087,7 +1184,7 @@ local function action(tab,glyph,title,description,color,callback)
             local step=spec.step or 1
             local display=spec.display or function(v) return tostring(v) end
             local valueBox=rounded(create("TextBox",{
-                Position=UDim2.fromOffset(364,0),Size=UDim2.fromOffset(141,28),
+                Position=UDim2.fromOffset(566,0),Size=UDim2.fromOffset(166,28),
                 BackgroundColor3=C.rail,TextColor3=C.text,
                 Font=Enum.Font.GothamBold,TextSize=11,Text=tostring(display(get())),
                 TextXAlignment=Enum.TextXAlignment.Center,
@@ -1095,7 +1192,7 @@ local function action(tab,glyph,title,description,color,callback)
             },row.container),8)
             stroke(valueBox,C.stroke,.68)
             local track=rounded(create("TextButton",{
-                Position=UDim2.fromOffset(7,39),Size=UDim2.fromOffset(493,10),
+                Position=UDim2.fromOffset(8,39),Size=UDim2.fromOffset(721,9),
                 BackgroundColor3=C.rail,BorderSizePixel=0,
                 Text="",AutoButtonColor=false,Active=true,
             },row.container),6)
@@ -1111,13 +1208,13 @@ local function action(tab,glyph,title,description,color,callback)
             },track),6)
             stroke(thumb,C.canvas,.40)
             create("TextLabel",{
-                Position=UDim2.fromOffset(5,54),Size=UDim2.fromOffset(170,17),
+                Position=UDim2.fromOffset(5,54),Size=UDim2.fromOffset(195,17),
                 BackgroundTransparency=1,Text=tostring(display(min)),
                 TextColor3=C.dim,Font=Enum.Font.Gotham,TextSize=10,
                 TextXAlignment=Enum.TextXAlignment.Left,
             },row.container)
             create("TextLabel",{
-                Position=UDim2.fromOffset(328,54),Size=UDim2.fromOffset(174,17),
+                Position=UDim2.fromOffset(541,54),Size=UDim2.fromOffset(192,17),
                 BackgroundTransparency=1,Text=tostring(display(max)),
                 TextColor3=C.dim,Font=Enum.Font.Gotham,TextSize=10,
                 TextXAlignment=Enum.TextXAlignment.Right,
@@ -1182,7 +1279,7 @@ local function action(tab,glyph,title,description,color,callback)
             local choices=spec
             local count=#choices
             local gap=6
-            local buttonWidth=(503-gap*(count-1))/count
+            local buttonWidth=(732-gap*(count-1))/count
             local buttons={}
             for i,option in ipairs(choices) do
                 local name=type(option)=="table" and option.label or option
@@ -1225,14 +1322,14 @@ local function action(tab,glyph,title,description,color,callback)
     end)
     on(card.MouseEnter,function()
         if alive then
-            animate(outline,.16,{Transparency=extra.edge.softenedAlpha(.36)})
-            animate(card,.16,{BackgroundColor3=C.hover})
+            animate(outline,.16,{Transparency=extra.edge.softenedAlpha(.48)})
+            animate(card,.16,{BackgroundColor3=C.panel})
         end
     end)
     on(card.MouseLeave,function()
         if alive then
-            animate(outline,.16,{Transparency=extra.edge.softenedAlpha(.72)})
-            animate(card,.16,{BackgroundColor3=C.card})
+            animate(outline,.16,{Transparency=extra.edge.softenedAlpha(.81)})
+            animate(card,.16,{BackgroundColor3=C.panel})
         end
     end)
     table.insert(featureCards,{card=card,expand=expand,settingsRefreshes=refreshes})
@@ -1620,7 +1717,9 @@ local function toggleAction(tab,glyph,title,description,color,get,set)
     local button,addSetting=action(tab,glyph,title,description,color,function()
         set(not get())
         refreshToggles()
+        globalEnv.ZAXConfigRuntime.changed()
     end)
+    globalEnv.ZAXConfigRuntime.registerToggle(title,get,set)
     table.insert(toggleWidgets,{button=button,get=get})
     refreshToggles()
     return addSetting
@@ -2021,23 +2120,69 @@ unloadConfig("Confirm Before Unload",{"Off","On"},
         unloadArmed=false
     end)
 
+section("SETTINGS","03  /  CONFIGURATION","Save and restore settings between executions")
+local configSaveButton,configSaveSettings=action("SETTINGS","SV","Save Config",
+    "Save all sliders, options, toggles, keybind and appearance",C.mint,function()
+        globalEnv.ZAXConfigRuntime.serial=globalEnv.ZAXConfigRuntime.serial+1
+        local ok,detail=globalEnv.ZAXConfigRuntime.write()
+        message(ok and "Configuration saved" or "Cannot save config",detail)
+    end)
+configSaveSettings("Autosave",{"On","Off"},
+    function() return globalEnv.ZAXConfigRuntime.autosave and "On" or "Off" end,
+    function(value)
+        globalEnv.ZAXConfigRuntime.autosave=(value=="On")
+        if globalEnv.ZAXConfigRuntime.muted then return end
+        if globalEnv.ZAXConfigRuntime.autosave then
+            globalEnv.ZAXConfigRuntime.changed()
+        else
+            -- Persist the disabled autosave preference once, before stopping.
+            globalEnv.ZAXConfigRuntime.serial=globalEnv.ZAXConfigRuntime.serial+1
+            globalEnv.ZAXConfigRuntime.write()
+        end
+    end)
+local configLoadButton=action("SETTINGS","LD","Load Saved Config",
+    "Reload last saved preferences and enabled tools",C.blue,function()
+        if globalEnv.ZAXConfigRuntime.reload then
+            local ok,detail=globalEnv.ZAXConfigRuntime.reload()
+            message(ok and "Configuration loaded" or "Load failed",detail)
+        end
+    end)
+local configResetButton=action("SETTINGS","DF","Reset Config",
+    "Restore default settings and replace saved config",C.orange,function()
+        if not globalEnv.ZAXConfigRuntime.resetArmed then
+            globalEnv.ZAXConfigRuntime.resetArmed=true
+            message("Confirm reset","Click Reset Config again to replace your saved settings")
+            task.delay(6,function()
+                if globalEnv.ZAXConfigRuntime then
+                    globalEnv.ZAXConfigRuntime.resetArmed=false
+                end
+            end)
+            return
+        end
+        globalEnv.ZAXConfigRuntime.resetArmed=false
+        if globalEnv.ZAXConfigRuntime.reset then
+            local ok,detail=globalEnv.ZAXConfigRuntime.reset()
+            message(ok and "Defaults restored" or "Reset incomplete",detail)
+        end
+    end)
+
 end
 
 -- THEME STUDIO: coordinated presets, then two precise live sliders.
 local themePage=pages.THEMES
 local themeGrid=rounded(create("Frame",{
-    LayoutOrder=1,Size=UDim2.fromOffset(543,303),
+    LayoutOrder=1,Size=UDim2.fromOffset(777,303),
     BackgroundColor3=C.panel,BackgroundTransparency=surfaceOpacity*.6,BorderSizePixel=0,
 },themePage),14)
 stroke(themeGrid,C.stroke,.72)
 create("TextLabel",{
-    Position=UDim2.fromOffset(20,15),Size=UDim2.fromOffset(500,23),
+    Position=UDim2.fromOffset(20,15),Size=UDim2.fromOffset(735,23),
     Text="Theme collection",TextColor3=C.text,
     Font=Enum.Font.GothamBold,TextSize=15,
     TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
 },themeGrid)
 create("TextLabel",{
-    Position=UDim2.fromOffset(20,39),Size=UDim2.fromOffset(500,19),
+    Position=UDim2.fromOffset(20,39),Size=UDim2.fromOffset(735,19),
     Text="Pick one coordinated palette for the whole interface.",
     TextColor3=C.dim,Font=Enum.Font.Gotham,TextSize=11,
     TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
@@ -2045,10 +2190,10 @@ create("TextLabel",{
 local paletteTiles={}
 local staticPreviewObjects=setmetatable({}, {__mode="k"})
 for index,name in ipairs(paletteNames) do
-    local px=16+((index-1)%2)*260
+    local px=17+((index-1)%2)*380
     local py=69+math.floor((index-1)/2)*75
     local tile=rounded(create("TextButton",{
-        Position=UDim2.fromOffset(px,py),Size=UDim2.fromOffset(251,66),
+        Position=UDim2.fromOffset(px,py),Size=UDim2.fromOffset(366,66),
         BackgroundColor3=C.card,BorderSizePixel=0,Text="",
         AutoButtonColor=false,
     },themeGrid),11)
@@ -2078,13 +2223,13 @@ for index,name in ipairs(paletteNames) do
         staticPreviewObjects[part]=true
     end
     create("TextLabel",{
-        Position=UDim2.fromOffset(69,12),Size=UDim2.fromOffset(171,22),
+        Position=UDim2.fromOffset(69,12),Size=UDim2.fromOffset(270,22),
         Text=name,TextColor3=C.text,Font=Enum.Font.GothamBold,
         TextSize=13,TextXAlignment=Enum.TextXAlignment.Left,
         BackgroundTransparency=1,
     },tile)
     create("TextLabel",{
-        Position=UDim2.fromOffset(69,36),Size=UDim2.fromOffset(167,18),
+        Position=UDim2.fromOffset(69,36),Size=UDim2.fromOffset(270,18),
         Text=(index==1 and "GRAPHITE") or (index==2 and "LAVENDER") or
             (index==3 and "ARCTIC BLUE") or (index==4 and "SOFT PINK") or
             (index==5 and "BOTANICAL") or "WARM GOLD",
@@ -2094,7 +2239,7 @@ for index,name in ipairs(paletteNames) do
     paletteTiles[name]={tile=tile,outline=outline}
 end
 local colorStudio=rounded(create("Frame",{
-    LayoutOrder=2,Size=UDim2.fromOffset(543,202),
+    LayoutOrder=2,Size=UDim2.fromOffset(777,202),
     BackgroundColor3=C.panel,BackgroundTransparency=surfaceOpacity*.6,BorderSizePixel=0,
 },themePage),14)
 stroke(colorStudio,C.stroke,.72)
@@ -2105,7 +2250,7 @@ create("TextLabel",{
     TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
 },colorStudio)
 local hexLabel=rounded(create("TextLabel",{
-    Position=UDim2.fromOffset(385,13),Size=UDim2.fromOffset(137,25),
+    Position=UDim2.fromOffset(621,13),Size=UDim2.fromOffset(135,25),
     Text=colorHex(C.mint),TextColor3=C.mint,
     Font=Enum.Font.GothamBold,TextSize=11,
     BackgroundColor3=C.card,BorderSizePixel=0,
@@ -2117,7 +2262,7 @@ create("TextLabel",{
     BackgroundTransparency=1,
 },colorStudio)
 local hueBar=rounded(create("Frame",{
-    Position=UDim2.fromOffset(21,76),Size=UDim2.fromOffset(501,12),
+    Position=UDim2.fromOffset(21,76),Size=UDim2.fromOffset(735,12),
     BackgroundColor3=C.card,BorderSizePixel=0,Active=true,
 },colorStudio),8)
 create("UIGradient",{
@@ -2144,7 +2289,7 @@ create("TextLabel",{
     TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
 },colorStudio)
 local saturationBar=rounded(create("Frame",{
-    Position=UDim2.fromOffset(21,136),Size=UDim2.fromOffset(501,12),
+    Position=UDim2.fromOffset(21,136),Size=UDim2.fromOffset(735,12),
     BackgroundColor3=C.card,BorderSizePixel=0,Active=true,
 },colorStudio),8)
 local saturationGradient=create("UIGradient",{
@@ -2159,14 +2304,14 @@ local satKnob=rounded(create("TextButton",{
 },saturationBar),6)
 stroke(satKnob,C.canvas,.26,1.5)
 local customLabel=create("TextLabel",{
-    Position=UDim2.fromOffset(20,168),Size=UDim2.fromOffset(500,23),
+    Position=UDim2.fromOffset(20,168),Size=UDim2.fromOffset(735,23),
     Text="Drag either slider to customize the accent",
     TextColor3=C.dim,Font=Enum.Font.Gotham,TextSize=11,
     TextXAlignment=Enum.TextXAlignment.Left,BackgroundTransparency=1,
 },colorStudio)
 -- Glass opacity control: changes only panel opacity, never text opacity.
 local glassStudio=rounded(create("Frame",{
-    LayoutOrder=3,Size=UDim2.fromOffset(543,105),
+    LayoutOrder=3,Size=UDim2.fromOffset(777,105),
     BackgroundColor3=C.panel,BackgroundTransparency=surfaceOpacity*.6,
     BorderSizePixel=0,
 },themePage),14)
@@ -2178,13 +2323,13 @@ create("TextLabel",{
     TextXAlignment=Enum.TextXAlignment.Left,
 },glassStudio)
 local glassValue=create("TextLabel",{
-    Position=UDim2.fromOffset(415,13),Size=UDim2.fromOffset(108,24),
+    Position=UDim2.fromOffset(628,13),Size=UDim2.fromOffset(129,24),
     Text=math.floor(surfaceOpacity*100+.5).."%",TextColor3=C.mint,
     Font=Enum.Font.GothamBold,TextSize=12,BackgroundTransparency=1,
     TextXAlignment=Enum.TextXAlignment.Right,
 },glassStudio)
 local glassBar=rounded(create("Frame",{
-    Position=UDim2.fromOffset(21,61),Size=UDim2.fromOffset(501,10),
+    Position=UDim2.fromOffset(21,61),Size=UDim2.fromOffset(735,10),
     BackgroundColor3=C.card,BorderSizePixel=0,Active=true,
 },glassStudio),5)
 local glassFill=rounded(create("Frame",{
@@ -2223,6 +2368,7 @@ local function setGlassFromX(x)
     globalEnv.CreamysChaosLabThemeGraphite={preset=paletteName,
         hue=accentHue,saturation=accentSaturation,
         custom=customAccent,opacity=surfaceOpacity}
+    globalEnv.ZAXConfigRuntime.changed()
 end
 local function startGlassDrag(input)
     if input.UserInputType==Enum.UserInputType.MouseButton1 or
@@ -2247,12 +2393,12 @@ on(UIS.InputEnded,function(input)
 end)
 
 local themeNote=rounded(create("Frame",{
-    LayoutOrder=4,Size=UDim2.fromOffset(543,58),
+    LayoutOrder=4,Size=UDim2.fromOffset(777,58),
     BackgroundColor3=C.badge,BackgroundTransparency=surfaceOpacity*.44,BorderSizePixel=0,
 },themePage),12)
 create("TextLabel",{
-    Position=UDim2.fromOffset(18,10),Size=UDim2.fromOffset(510,39),
-    Text="Changes apply instantly. Theme settings persist while this session is open.",
+    Position=UDim2.fromOffset(18,10),Size=UDim2.fromOffset(735,39),
+    Text="Changes apply instantly. Save settings under Preferences > Configuration.",
     TextColor3=C.text,Font=Enum.Font.GothamMedium,TextSize=11,
     TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,
     BackgroundTransparency=1,
@@ -2265,8 +2411,7 @@ local function saveTheme()
         saturation=accentSaturation,custom=customAccent,opacity=surfaceOpacity}
 end
 local function updateColorStudio()
-    themeChip.Text="THEME  /  "..string.upper(paletteName)..
-        (customAccent and " + CUSTOM" or "")
+    themeChip.Text=string.upper(paletteName)..(customAccent and " + CUSTOM" or "  THEME")
     hexLabel.Text=colorHex(C.mint)
     hueKnob.Position=UDim2.fromScale(accentHue,.5)
     satKnob.Position=UDim2.fromScale((accentSaturation-.18)/.82,.5)
@@ -2334,6 +2479,7 @@ local function applyTheme()
     applyGlassOpacity()
     extra.edge.applyStyle()
     saveTheme()
+    globalEnv.ZAXConfigRuntime.changed()
 end
 for name,ui in pairs(paletteTiles) do
     on(ui.tile.MouseButton1Click,function()
@@ -2395,6 +2541,119 @@ on(UIS.InputEnded,function(input)
 end)
 updateColorStudio()
 
+-- Collect all registered controls, including appearance and keyboard shortcut.
+function globalEnv.ZAXConfigRuntime.snapshot()
+    local settings={}
+    for key,record in pairs(globalEnv.ZAXConfigRuntime.settings) do
+        local ok,value=pcall(record.get)
+        if ok and (type(value)=="string" or type(value)=="number" or
+            type(value)=="boolean") then
+            settings[key]=value
+        end
+    end
+    local toggles={}
+    for key,record in pairs(globalEnv.ZAXConfigRuntime.toggles) do
+        local ok,value=pcall(record.get)
+        if ok and type(value)=="boolean" then toggles[key]=value end
+    end
+    return {
+        version=1, autosave=globalEnv.ZAXConfigRuntime.autosave, keybind=toggleKey.Name,
+        settings=settings,toggles=toggles,
+        theme={preset=paletteName,hue=accentHue,saturation=accentSaturation,
+            custom=customAccent,opacity=surfaceOpacity},
+        style={cornerRoundness=extra.cornerRoundness,
+            borderSoftness=extra.borderSoftness,
+            toastDuration=extra.toastDuration,uiMotion=extra.uiMotion},
+    }
+end
+function globalEnv.ZAXConfigRuntime.applySaved(data,restoreToggles)
+    if type(data)~="table" then return end
+    globalEnv.ZAXConfigRuntime.muted=true
+    local opts=type(data.settings)=="table" and data.settings or {}
+    for key,record in pairs(globalEnv.ZAXConfigRuntime.settings) do
+        if opts[key]~=nil then globalEnv.ZAXConfigRuntime.applySetting(record,opts[key]) end
+    end
+    if type(data.theme)=="table" then
+        local theme=data.theme
+        if type(theme.preset)=="string" and palettes[theme.preset] then
+            paletteName=theme.preset
+        end
+        if type(theme.hue)=="number" then accentHue=math.clamp(theme.hue,0,1) end
+        if type(theme.saturation)=="number" then
+            accentSaturation=math.clamp(theme.saturation,.18,1)
+        end
+        customAccent=theme.custom==true
+        if type(theme.opacity)=="number" then
+            surfaceOpacity=math.clamp(theme.opacity,0,.32)
+        end
+        applyTheme()
+    end
+    if type(data.keybind)=="string" and Enum.KeyCode[data.keybind] then
+        toggleKey=Enum.KeyCode[data.keybind]
+        keyButton.Text="KEY: "..string.upper(toggleKey.Name)
+    end
+    globalEnv.ZAXConfigRuntime.autosave=data.autosave~=false
+    if restoreToggles and type(data.toggles)=="table" then
+        for key,record in pairs(globalEnv.ZAXConfigRuntime.toggles) do
+            local desired=data.toggles[key]
+            if type(desired)=="boolean" and record.get()~=desired then
+                local ok,err=pcall(record.set,desired)
+                if not ok then warn("[ZAX Config] Toggle restore:",key,err) end
+            end
+        end
+    end
+    if refreshToggles then refreshToggles() end
+    for _,item in ipairs(featureCards) do
+        for _,refresh in ipairs(item.settingsRefreshes) do refresh() end
+    end
+    globalEnv.ZAXConfigRuntime.muted=false
+end
+function globalEnv.ZAXConfigRuntime.reload()
+    local data,detail=globalEnv.ZAXConfigRuntime.read()
+    if not data then return false,detail end
+    globalEnv.ZAXConfigRuntime.serial=globalEnv.ZAXConfigRuntime.serial+1
+    globalEnv.ZAXConfigRuntime.loaded=data
+    globalEnv.ZAXConfigRuntime.applySaved(data,true)
+    return true,"Loaded from "..globalEnv.ZAXConfigRuntime.path
+end
+function globalEnv.ZAXConfigRuntime.reset()
+    globalEnv.ZAXConfigRuntime.serial=globalEnv.ZAXConfigRuntime.serial+1
+    globalEnv.ZAXConfigRuntime.muted=true
+    for key,record in pairs(globalEnv.ZAXConfigRuntime.toggles) do
+        local default=globalEnv.ZAXConfigRuntime.toggleDefaults[key]
+        if type(default)=="boolean" and record.get()~=default then
+            pcall(record.set,default)
+        end
+    end
+    for key,record in pairs(globalEnv.ZAXConfigRuntime.settings) do
+        local default=globalEnv.ZAXConfigRuntime.defaults[key]
+        if default~=nil then globalEnv.ZAXConfigRuntime.applySetting(record,default) end
+    end
+    -- Restore factory Graphite, regardless of previously saved session style.
+    extra.cornerRoundness=1.50
+    extra.borderSoftness=25
+    extra.toastDuration=2.5
+    extra.uiMotion="On"
+    extra.edge.applyStyle()
+    extra.saveUiStyle()
+    paletteName="Graphite"
+    accentHue=.44
+    accentSaturation=.72
+    customAccent=false
+    surfaceOpacity=.14
+    applyTheme()
+    toggleKey=Enum.KeyCode.RightShift
+    keyButton.Text="KEY: RIGHTSHIFT"
+    globalEnv.ZAXConfigRuntime.autosave=true
+    if refreshToggles then refreshToggles() end
+    for _,item in ipairs(featureCards) do
+        for _,refresh in ipairs(item.settingsRefreshes) do refresh() end
+    end
+    globalEnv.ZAXConfigRuntime.muted=false
+    if not globalEnv.ZAXConfigRuntime.supported then return false,"Defaults restored for this session; file APIs unavailable" end
+    return globalEnv.ZAXConfigRuntime.write()
+end
+
 -- Navigation: minimal active pill and text, no decorative icon tiles.
 local function chooseTab(name)
     activePage=name
@@ -2402,7 +2661,7 @@ local function chooseTab(name)
     pageTitle.Text=pageNames[name][1]
     pageSub.Text=pageNames[name][2]
     sidePanel.Visible=false
-    contextPanel.Visible=true
+    contextPanel.Visible=false
     local context=contextContents[name]
     if context then
         contextMark.Text=context.icon
@@ -2417,29 +2676,29 @@ local function chooseTab(name)
 end
 for i,name in ipairs(navList) do
     local nav=rounded(create("TextButton",{
-        Position=UDim2.fromOffset(13,140+(i-1)*56),
-        Size=UDim2.fromOffset(168,47),
+        Position=UDim2.fromOffset(14,134+(i-1)*56),
+        Size=UDim2.fromOffset(177,46),
         BackgroundColor3=C.rail,BorderSizePixel=0,
         Text="",AutoButtonColor=false,
-    },left),10)
+    },left),14)
     local indicator=rounded(create("Frame",{
-        Position=UDim2.fromOffset(0,12),Size=UDim2.fromOffset(3,24),
+        Position=UDim2.fromOffset(0,10),Size=UDim2.fromOffset(3,26),
         BackgroundColor3=C.mint,BackgroundTransparency=1,
         BorderSizePixel=0,
     },nav),2)
     local navNames={MAIN="Aim",MOVEMENT="Movement",VISUALS="Visuals",
         THEMES="Appearance",SETTINGS="Settings"}
-    local navNums={MAIN="01",MOVEMENT="02",VISUALS="03",THEMES="04",SETTINGS="05"}
+    local navNums={MAIN="A",MOVEMENT="M",VISUALS="V",THEMES="T",SETTINGS="S"}
     create("TextLabel",{
-        Position=UDim2.fromOffset(16,0),Size=UDim2.fromOffset(26,47),
+        Position=UDim2.fromOffset(16,0),Size=UDim2.fromOffset(30,46),
         Text=navNums[name],Font=Enum.Font.GothamBold,TextSize=11,
         TextColor3=C.mint,BackgroundTransparency=1,
         TextXAlignment=Enum.TextXAlignment.Left,
     },nav)
     local label=create("TextLabel",{
-        Position=UDim2.fromOffset(46,0),Size=UDim2.fromOffset(116,47),
+        Position=UDim2.fromOffset(55,0),Size=UDim2.fromOffset(117,46),
         Text=navNames[name],TextColor3=C.dim,
-        Font=Enum.Font.GothamMedium,TextSize=12,
+        Font=Enum.Font.GothamMedium,TextSize=13,
         TextXAlignment=Enum.TextXAlignment.Left,
         BackgroundTransparency=1,
     },nav)
@@ -2498,14 +2757,14 @@ displaySelected()
 local opener=rounded(create("TextButton", {
     Name="Launcher",Position=UDim2.new(0,20,.5,-22),
     Size=UDim2.fromOffset(112,44),BackgroundColor3=C.panel,
-    Text="ZAX  /  OPEN",Font=Enum.Font.GothamBold,TextSize=11,
+    Text="ZAX  /  OPEN",Font=Enum.Font.GothamBold,TextSize=12,
     TextColor3=C.mint,BorderSizePixel=0,Visible=false,
 },gui),11)
 stroke(opener,C.mint,.45)
 local function setVisible(v)
     shown=v
     window.Visible=v
-    backdrop.Visible=false -- Never re-enable the shadow behind the window
+    backdrop.Visible=false -- Keep shadow anchor hidden on show/hide
     opener.Visible=not v
 end
 on(opener.MouseButton1Click,function() setVisible(true) end)
@@ -2522,6 +2781,7 @@ on(UIS.InputBegan,function(input,handled)
             toggleKey=input.KeyCode
         end
         keyButton.Text="KEY: "..string.upper(toggleKey.Name)
+        globalEnv.ZAXConfigRuntime.changed()
         return
     end
     if handled or UIS:GetFocusedTextBox() then return end
@@ -2539,6 +2799,7 @@ on(restore.MouseButton1Click,function()
     extra.clickTeleportEnabled=false
     refreshToggles()
     message("Movement reset","All movement tools disabled")
+    globalEnv.ZAXConfigRuntime.changed()
 end)
 
 -- v2 click-teleport handler. Never trigger on buttons/textboxes.
@@ -2803,6 +3064,14 @@ local function setupCharacter(nextCharacter)
     originalSpeed=h and h.WalkSpeed or nil
     originalJumpPower=h and h.JumpPower or nil
     originalJumpHeight=h and h.JumpHeight or nil
+    if not globalEnv.ZAXConfigRuntime.restoredOnce then
+        globalEnv.ZAXConfigRuntime.restoredOnce=true
+        task.defer(function()
+            if alive and globalEnv.ZAXConfigRuntime.loaded and type(globalEnv.ZAXConfigRuntime.loaded.toggles)=="table" then
+                globalEnv.ZAXConfigRuntime.applySaved(globalEnv.ZAXConfigRuntime.loaded,true)
+            end
+        end)
+    end
     if refreshToggles then refreshToggles() end
 end
 on(me.CharacterAdded,function(newCharacter)
@@ -2813,6 +3082,11 @@ if me.Character then task.spawn(setupCharacter,me.Character) end
 -- Fully reversible cleanup of this instance.
 unload=function()
     if not alive then return end
+    globalEnv.ZAXConfigRuntime.serial=globalEnv.ZAXConfigRuntime.serial+1
+    if globalEnv.ZAXConfigRuntime.autosave and not globalEnv.ZAXConfigRuntime.muted then
+        local ok,why=globalEnv.ZAXConfigRuntime.write()
+        if not ok and globalEnv.ZAXConfigRuntime.supported then warn("[ZAX Config] Save on unload:",why) end
+    end
     contactToken=contactToken+1
     if contactBusy then restoreContact() end
     if flyActive then setFly(false) else removeFlightObjects() end
@@ -2852,5 +3126,11 @@ globalEnv.CreamysChaosLabUnload=unload
 extra.edge.applyStyle()
 saveTheme()
 extra.saveUiStyle()
-message("ZAX READY","Universal Hub loaded")
+globalEnv.ZAXConfigRuntime.muted=false
+if globalEnv.ZAXConfigRuntime.supported and globalEnv.ZAXConfigRuntime.note=="No saved config yet" and globalEnv.ZAXConfigRuntime.autosave then
+    globalEnv.ZAXConfigRuntime.changed() -- Write the initial defaults only if this is a fresh install.
+end
+message("ZAX READY",globalEnv.ZAXConfigRuntime.supported and
+    "Config autosave available in Settings" or
+    "Settings are session-only (no file storage API)")
 print("[ZAX Universal Hub] Loaded. RightShift toggles the UI.")
